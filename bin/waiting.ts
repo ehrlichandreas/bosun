@@ -1,0 +1,133 @@
+#!/usr/bin/env node
+/**
+ * Put in front of whoever has context what this log is waiting for.
+ *
+ *   node bin/waiting.ts            every standing falsifier, oldest first
+ *   node bin/waiting.ts --log DIR  the same, for the project at DIR
+ *
+ * Every entry names what one would observe to know it was wrong, and until
+ * now nothing ever looked at those sentences again: a net with every wire
+ * described and none strung. This does not judge - a falsifier is prose, and
+ * judging it needs the context of whoever is standing in the project. It
+ * lists, and it hands over the command that records a firing.
+ *
+ * A firing is itself a decision-shaped event: the observation becomes its own
+ * entry, superseding in part the claim it refuted. No new state, no new
+ * field - the link machinery already renders the banner on the refuted page.
+ */
+
+import {
+  logRoot,
+  takeLog,
+  unknownFlag,
+  noLogRoot,
+  decisionsDir,
+  isDirectRun,
+  sibling,
+} from "./paths.ts";
+import { load, type Loaded } from "./render.ts";
+import { LATEST } from "./schema.ts";
+
+export function main(passed: string[]): number {
+  const { rest: argv, from } = takeLog(passed);
+  const unknown = unknownFlag(argv, []);
+  if (unknown) {
+    console.error(`refused: unknown flag ${unknown}`);
+    return 1;
+  }
+  const root = logRoot(from);
+  if (!root) {
+    console.error(noLogRoot(from));
+    return 1;
+  }
+  let entries: Loaded[];
+  try {
+    entries = load(decisionsDir(root));
+  } catch (error) {
+    console.error("refused:", (error as Error).message);
+    return 1;
+  }
+  if (entries.length === 0) {
+    console.log(`no entries in ${decisionsDir(root)}, nothing is waiting`);
+    return 0;
+  }
+  for (const entry of entries) {
+    const held = (entry.schema as number) ?? 1;
+    if (held !== LATEST) {
+      console.error(
+        `refused: ${entry.stem}.json is schema v${held}. Run upgrade.mjs ` +
+          `once, then ask again.`,
+      );
+      return 1;
+    }
+  }
+
+  // Retired outright means the claim no longer binds, so its falsifier no
+  // longer waits. A part link leaves the rest of the entry standing, and with
+  // it the falsifier, which guards what remains.
+  const handles = new Map<string, Loaded>();
+  for (const entry of entries) {
+    if (entry.id) handles.set(entry.id, entry);
+    if (entry.alias) handles.set(entry.alias, entry);
+  }
+  const retired = new Set<string>();
+  for (const entry of entries) {
+    for (const link of entry.supersedes ?? []) {
+      if (link.extent !== "whole") continue;
+      const target = handles.get(link.id);
+      if (target) retired.add(target.stem);
+    }
+  }
+
+  const standing = entries.filter((entry) => !retired.has(entry.stem));
+  const armed = standing.filter((entry) => entry.falsifier);
+  const unarmed = standing.filter((entry) => !entry.falsifier);
+  const save = sibling(import.meta.url, "save");
+
+  if (armed.length === 0 && unarmed.length === 0) {
+    console.log("nothing is standing, nothing is waiting");
+    return 0;
+  }
+
+  console.log(
+    `${armed.length} standing entr${armed.length === 1 ? "y" : "ies"} ` +
+      `waiting to be proved wrong. Read each against what you can see from ` +
+      `here; this tool cannot judge prose, whoever has context can.`,
+  );
+  for (const entry of armed) {
+    console.log(`\n${entry.stem}`);
+    console.log(`  claim:     ${entry.statement}`);
+    console.log(`  fires if:  ${entry.falsifier}`);
+  }
+  console.log(
+    `\nWhen one has fired, the observation is its own entry:\n` +
+      `  node "${save}" --statement "what was observed" \\\n` +
+      `    --decision "..." --why "..." --falsifier "..." \\\n` +
+      `    --supersedes-part "part-of-the-refuted-name :: the claim that fired"`,
+  );
+
+  if (unarmed.length) {
+    console.log(
+      `\n${unarmed.length} standing entr${unarmed.length === 1 ? "y has" : "ies have"} ` +
+        `no falsifier yet - a wire described by nothing, waiting for nothing:`,
+    );
+    for (const entry of unarmed) {
+      console.log(`  ${entry.stem}`);
+      console.log(`    arm it: node "${save}" --id ${entry.stem} --falsifier "..."`);
+    }
+  }
+  return 0;
+}
+
+// Only when run directly. Importing this file must not execute it.
+// realpathSync on both sides: Node canonicalises import.meta.url through
+// symlinks but leaves process.argv[1] as typed, so reaching a script through
+// a symlinked path made every one of these silently do nothing and exit 0.
+if (isDirectRun(import.meta.url)) {
+  try {
+    process.exitCode = main(process.argv.slice(2));
+  } catch (error) {
+    console.error("refused:", (error as Error).message);
+    process.exitCode = 1;
+  }
+}

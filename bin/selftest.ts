@@ -1,0 +1,2257 @@
+#!/usr/bin/env node
+/**
+ * One runnable check. No framework, no dependency, no build, no CI.
+ *
+ *   node bin/selftest.ts
+ *
+ * It exists because of a concrete failure, not because tests are virtuous: the
+ * schema v5 bump silently broke deduplicate, an entry in the log went on citing
+ * that function as the thing preventing id collisions, and nobody noticed until
+ * a stranger read the code. Every future schema bump would repeat that.
+ *
+ * What it covers is exactly what breaks silently: the migration chain, the
+ * collision handling, and the argument parsing that turns human text into an
+ * entry. It writes nothing.
+ */
+
+import assert from "node:assert/strict";
+import {
+  existsSync,
+  rmSync,
+  symlinkSync,
+  realpathSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+  copyFileSync,
+} from "node:fs";
+import { join, basename, dirname } from "node:path";
+// A namespace import never throws over a missing name, so this loads on a
+// node without the stripper - which is the node the gate below exists for.
+import * as nodeModule from "node:module";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { LATEST, validate, missingFields, versions, loadSchema } from "./schema.ts";
+import { walk, deduplicate, MIGRATIONS } from "./upgrade.ts";
+import { parseArgs, slugify, utcId } from "./save.ts";
+import {
+  logRoot,
+  repoRoot,
+  takeLog,
+  unknownFlag,
+  sibling,
+  originOf,
+  isDirectRun,
+  SCRIPT_ROOT,
+} from "./paths.ts";
+import { INDEX_MARKER, linkProblems, stemProblems, mdInline, mdCell, type Loaded } from "./render.ts";
+import {
+  settingsProblems,
+  reconcile,
+  markerProblem,
+  spliceRule,
+  hookCommand,
+  otherInstall,
+  namedHook,
+} from "./install.ts";
+import { status, readFoldState, FOLD_STATE, EMPTY_STATE, type FoldState } from "./fold.ts";
+
+let failures = 0;
+const scratch: string[] = [];
+
+/**
+ * The environment for spawning install.ts.
+ *
+ * install asks the `node` on PATH whether it can run TypeScript and refuses if
+ * it cannot, which is right for the product and wrong for a check: on a machine
+ * whose PATH node is a build without the stripper, four checks that have
+ * nothing to do with node failed on that refusal. A check tests the code, not
+ * the machine it happens to run on, so it puts the interpreter running it at
+ * the front of PATH - that one demonstrably runs TypeScript, since it is
+ * running this.
+ */
+const INSTALL_ENV = {
+  ...process.env,
+  PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ""}`,
+};
+
+/**
+ * The named tool in the layer this run executes from, and that layer's
+ * directory and extension.
+ *
+ * bin/save.ts hardcoded in the spawns below was the E87 failure inside the
+ * checks themselves: `node dist/selftest.mjs` - the one command the README
+ * hands an adopter as the smoke test - spawned the typed source, which needs
+ * the very stripper dist exists to do without, and failed on exactly the
+ * plain node it is meant to reassure.
+ */
+const tool = (name: string): string => sibling(import.meta.url, name);
+const LAYER = dirname(tool("save"));
+const EXT = tool("save").endsWith(".mjs") ? ".mjs" : ".ts";
+
+/** Throwaway project, removed when the run ends. */
+function projectDir(marker: "dir" | "file"): string {
+  const dir = mkdtempSync(join(tmpdir(), "bosun-selftest-"));
+  scratch.push(dir);
+  if (marker === "dir") mkdirSync(join(dir, "decisions"));
+  else writeFileSync(join(dir, "DECISIONS.md"), "", "utf8");
+  return dir;
+}
+
+function check(name: string, body: () => void): void {
+  try {
+    body();
+    console.log("  ok   ", name);
+  } catch (error) {
+    failures += 1;
+    console.error("  FAIL ", name);
+    console.error("        ", (error as Error).message.split("\n")[0]);
+  }
+}
+
+function complete(over: Record<string, unknown> = {}) {
+  return {
+    schema: 1,
+    id: "a-slug",
+    alias: "E1",
+    date: "2026-08-27",
+    origin: "bosun",
+    author_role: "system",
+    statement: "A statement",
+    quote: null,
+    trigger: null,
+    decision: "what holds",
+    why: "the reasoning",
+    rejected: [],
+    reason_type: null,
+    implementation: null,
+    consequence: null,
+    falsifier: "what would show it was wrong",
+    supersedes: [],
+    note: null,
+    provenance: null,
+    ...over,
+  };
+}
+
+console.log(
+  `schemas v1..v${LATEST}, migrations from ${Object.keys(MIGRATIONS).join(", ")}`,
+);
+
+
+check("what the adopter is shown to type is what the tools accept", () => {
+  // The README, the skill and the hook are read as one document, and E95 fixed
+  // a day of drift between them by hand. The part of that drift a script can
+  // catch: a flag named in any of the three that no tool accepts, and a file
+  // the hook or the docs point at that does not ship. A claim that
+  // misdescribes behaviour still needs a reader.
+  const docs: [string, string][] = [
+    ["hook/presence.sh", readFileSync(join(SCRIPT_ROOT, "hook/presence.sh"), "utf8")],
+    ["skill/SKILL.md", readFileSync(join(SCRIPT_ROOT, "skill/SKILL.md"), "utf8")],
+    ["README.md", readFileSync(join(SCRIPT_ROOT, "README.md"), "utf8")],
+  ];
+
+  const schema = loadSchema(LATEST) as { properties?: Record<string, unknown> };
+  const accepted = new Set([
+    ...Object.keys(schema.properties ?? {}).map((f) => f.replaceAll("_", "-")),
+    "supersedes-part", "quote-lang", "log", // save, beyond the schema fields
+    "done", "check", "bootstrap", "rebuild", "checked-by", // fold
+    "dry-run", // upgrade
+    "write", "agent", // install
+  ]);
+  accepted.delete("date"); // minted from the clock; save refuses it by design
+  accepted.delete("schema"); // stamped by the tools, never typed
+
+  for (const [name, text] of docs) {
+    // A line about git carries git's flags, which are not ours to validate.
+    const ours = text.split("\n").filter((line) => !/\bgit\b/.test(line));
+    for (const [, flag] of ours.join("\n").matchAll(/--([a-z][a-z-]*)/g)) {
+      assert.ok(accepted.has(flag), `${name} shows --${flag}, which no tool accepts`);
+    }
+  }
+
+  // Every file the three name has to ship: the hook names $BOSUN/<path>, the
+  // skill <bosun>/<path>, the README dist/<script>. A rename that forgets
+  // these texts sends every adopter a command that cannot run.
+  const named: [string, string][] = [];
+  for (const [, path] of docs[0][1].matchAll(/\$BOSUN\/([\w./-]+)/g)) named.push(["hook", path]);
+  for (const [, path] of docs[1][1].matchAll(/<bosun>\/([\w./-]+)/g)) named.push(["skill", path]);
+  for (const [, script] of docs[2][1].matchAll(/dist\/([\w-]+\.mjs)/g)) named.push(["README", `dist/${script}`]);
+  assert.ok(named.length >= 10, "the extraction found the commands, not nothing");
+  for (const [where, path] of named) {
+    const bare = path.replace(/\.+$/, ""); // the sentence's full stop, not the path's
+    assert.ok(existsSync(join(SCRIPT_ROOT, bare)), `${where} names ${bare}, which does not exist`);
+  }
+});
+
+check("every schema version has a migration out of it", () => {
+  for (const version of versions()) {
+    if (version === LATEST) continue;
+    assert.equal(
+      typeof MIGRATIONS[version],
+      "function",
+      `no migration from v${version}`,
+    );
+  }
+});
+
+check("a v1 entry walks to the newest schema", () => {
+  const [migrated, steps] = walk(complete(), "test.json");
+  assert.equal(migrated.schema, LATEST);
+  assert.equal(steps.length, LATEST - 1);
+  assert.deepEqual(validate(migrated, LATEST), []);
+});
+
+check("an id written under v2 arrives with -utc and milliseconds", () => {
+  const [migrated] = walk(
+    complete({ schema: 2, id: "2026-08-28T17:10:03Z" }),
+    "test.json",
+  );
+  assert.equal(migrated.id, "2026-08-28-17-10-03-000-utc");
+});
+
+check("a slug id from v1 is never turned into a timestamp", () => {
+  const [migrated] = walk(complete(), "test.json");
+  assert.equal(migrated.id, "a-slug");
+});
+
+check("a string supersedes link gains an extent", () => {
+  const [migrated] = walk(
+    complete({ schema: 5, id: "x", supersedes: ["E19"] }),
+    "test.json",
+  );
+  assert.deepEqual(migrated.supersedes, [
+    { id: "E19", extent: "whole", detail: null },
+  ]);
+});
+
+check("deduplicate separates two ids that collide after migration", () => {
+  const rows = [
+    { name: "a.json", entry: complete({ schema: 3, id: "2026-08-28-17-16-23", alias: "E29" }) },
+    { name: "b.json", entry: complete({ schema: 3, id: "2026-08-28-17-16-23", alias: "E30" }) },
+  ];
+  const walked = rows.map((one) => ({
+    name: one.name,
+    entry: walk(one.entry, one.name)[0],
+  }));
+  assert.equal(walked[0].entry.id, walked[1].entry.id, "should collide first");
+  const renamed = deduplicate(walked);
+  assert.equal(renamed.length, 1, "one entry should be renamed");
+  assert.notEqual(walked[0].entry.id, walked[1].entry.id);
+  assert.equal(walked[1].entry.id, "2026-08-28-17-16-23-001-utc");
+});
+
+check("deduplicate reports nothing when there is nothing to do", () => {
+  assert.deepEqual(
+    deduplicate([
+      { name: "a.json", entry: complete({ id: "one" }) },
+      { name: "b.json", entry: complete({ id: "two" }) },
+    ]),
+    [],
+  );
+});
+
+check("an entry with an unknown field is refused, not damaged", () => {
+  assert.throws(
+    () => walk(complete({ schema: LATEST, id: "x", nope: 1 }), "t"),
+    /not allowed by schema/,
+  );
+});
+
+check("a missing required field is a gap, a wrong type is a defect", () => {
+  const gap = complete({ schema: LATEST, falsifier: null });
+  assert.deepEqual(missingFields(gap, LATEST), ["falsifier"]);
+  assert.equal(
+    validate(gap, LATEST).filter((p) => p.kind === "invalid").length,
+    0,
+  );
+
+  const broken = complete({ schema: LATEST, statement: 42 });
+  assert.ok(validate(broken, LATEST).some((p) => p.kind === "invalid"));
+});
+
+check("utcId is UTC and matches the frozen format", () => {
+  const id = utcId(new Date(Date.UTC(2026, 7, 28, 17, 10, 3, 456)));
+  assert.equal(id, "2026-08-28-17-10-03-456-utc");
+  assert.match(id, /^\d{4}-\d{2}-\d{2}(-\d{2}){3}-\d{3}-utc$/);
+});
+
+check("a flag without a value is refused, not filled from the next flag", () => {
+  assert.throws(
+    () => parseArgs(["--statement", "--decision", "x"]),
+    /--statement needs a value/,
+  );
+});
+
+check("--flag=value works and keeps colons in the value", () => {
+  assert.deepEqual(parseArgs(["--why=a: b"]), { why: "a: b" });
+});
+
+check("--quote-lang applies whatever order it comes in", () => {
+  assert.deepEqual(parseArgs(["--quote-lang", "en", "--quote", "hello"]).quote, {
+    text: "hello",
+    lang: "en",
+  });
+  assert.deepEqual(parseArgs(["--quote", "hallo"]).quote, {
+    text: "hallo",
+    lang: "und",
+  });
+  assert.throws(() => parseArgs(["--quote-lang", "en"]), /without --quote/);
+});
+
+check("--rejected needs both halves", () => {
+  assert.deepEqual(parseArgs(["--rejected", "a :: b"]).rejected, [
+    { option: "a", because: "b" },
+  ]);
+  assert.throws(() => parseArgs(["--rejected", "a"]), /option :: because/);
+  assert.throws(
+    () => parseArgs(["--rejected", "a :: b :: c"]),
+    /option :: because/,
+  );
+});
+
+check("supersedes carries an extent, and part demands a detail", () => {
+  assert.deepEqual(parseArgs(["--supersedes", "E19"]).supersedes, [
+    { id: "E19", extent: "whole", detail: null },
+  ]);
+  assert.deepEqual(parseArgs(["--supersedes-part", "E23 :: the id"]).supersedes, [
+    { id: "E23", extent: "part", detail: "the id" },
+  ]);
+  assert.throws(
+    () => parseArgs(["--supersedes-part", "E23"]),
+    /what was replaced/,
+  );
+});
+
+check("slugify survives scripts it cannot transliterate", () => {
+  assert.equal(slugify("Zwei Systeme: eines weiß"), "zwei-systeme-eines-weiss");
+  assert.equal(slugify("über".normalize("NFD")), "ueber");
+  assert.equal(slugify("!!! ???"), "");
+});
+
+check("the log root is the project you stand in, never the install", () => {
+  // A throwaway project with a marker, not the checkout itself: the check
+  // tests the walk, not whether this repository happens to keep a log.
+  const standing = mkdtempSync(join(tmpdir(), "bosun-standing-"));
+  scratch.push(standing);
+  mkdirSync(join(standing, "decisions"));
+  assert.equal(logRoot(standing), standing);
+  assert.equal(originOf("/tmp/some-project"), "some-project");
+  assert.equal(logRoot("/"), null, "no marker means no log, not the install");
+});
+
+
+check("the walk stops at the repository, so one log per checkout", () => {
+  // A working directory holding several checkouts, with a log above them all:
+  // every repository used to write into that one log and stamp its own name
+  // as the origin, which is a log that says two projects decided the same
+  // thing and no way to tell which.
+  const above = mkdtempSync(join(tmpdir(), "bosun-above-"));
+  scratch.push(above);
+  mkdirSync(join(above, "decisions"));
+  const repo = join(above, "checkout");
+  mkdirSync(join(repo, "src"), { recursive: true });
+  mkdirSync(join(repo, ".git"));
+
+  assert.equal(logRoot(join(repo, "src")), null, "the log above is not ours");
+  assert.equal(repoRoot(join(repo, "src")), repo);
+  assert.equal(logRoot(above), above, "the outer log is still its own");
+
+  // Its own log wins over the boundary, from anywhere inside.
+  mkdirSync(join(repo, "decisions"));
+  assert.equal(logRoot(join(repo, "src")), repo);
+
+  // A worktree and a submodule leave a .git file, not a directory.
+  const linked = join(above, "worktree");
+  mkdirSync(linked);
+  writeFileSync(join(linked, ".git"), "gitdir: /elsewhere\n", "utf8");
+  assert.equal(logRoot(linked), null, "a .git file bounds it just as much");
+});
+
+check("--log names the project, relative to where you stand", () => {
+  const project = realpathSync(projectDir("dir"));
+  const deep = join(project, "src", "inner");
+  mkdirSync(deep, { recursive: true });
+
+  const { rest, from } = takeLog(["--statement", "x", "--log", "src/inner"], project);
+  assert.deepEqual(rest, ["--statement", "x"], "--log never reaches the fields");
+  assert.equal(logRoot(from), project, "a path inside finds the same log");
+
+  assert.equal(takeLog(["--log=src"], project).from, join(project, "src"));
+  assert.equal(takeLog(["--check"], project).from, project, "absent means here");
+
+  // Canonicalised: the origin of every entry is the basename of this root, and
+  // the working directory it stands in for is always canonical. Through a
+  // symlink the entries were stamped with the link\'s name, permanently.
+  const link = join(dirname(project), `${basename(project)}-link`);
+  symlinkSync(project, link);
+  scratch.push(link);
+  assert.equal(takeLog(["--log", link], process.cwd()).from, project,
+    "the link resolves to the project, so the origin is the project");
+
+  // The failures save already refuses for every other flag.
+  assert.throws(() => takeLog(["--log", "--check"], project), /needs a directory/);
+  assert.throws(() => takeLog(["--log"], project), /needs a directory/);
+  assert.throws(() => takeLog(["--log", "nowhere"], project), /is not a directory/);
+});
+
+check("save reaches another project by --log, and opens its first log", () => {
+  const here = mkdtempSync(join(tmpdir(), "bosun-elsewhere-"));
+  scratch.push(here);
+  const project = projectDir("dir");
+  const run = (cwd: string, args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args], {
+      cwd,
+      encoding: "utf8",
+    });
+
+  const wrote = run(here, ["--log", project, "--statement", "Reached from outside",
+    "--decision", "d", "--why", "w", "--falsifier", "f"]);
+  assert.equal(wrote.status, 0, wrote.stderr);
+  const written = readdirSync(join(project, "decisions")).filter((n) => n.endsWith(".json"));
+  assert.equal(written.length, 1, "it landed in the named project, not here");
+  assert.equal(existsSync(join(here, "decisions")), false, "and nothing here");
+  const entry = JSON.parse(readFileSync(join(project, "decisions", written[0]), "utf8"));
+  assert.equal(entry.origin, basename(project), "the origin is the named project");
+  // render is spawned as a child and has to be told the same thing.
+  assert.ok(existsSync(join(project, "DECISIONS.md")), "the index was rendered");
+
+  // A repository with no log yet: the first decision opens one rather than
+  // being refused, because it is made once, in the minute somebody asks why.
+  const fresh = mkdtempSync(join(tmpdir(), "bosun-fresh-repo-"));
+  scratch.push(fresh);
+  mkdirSync(join(fresh, ".git"));
+  mkdirSync(join(fresh, "src"));
+  const opened = run(join(fresh, "src"), ["--statement", "The first one",
+    "--decision", "d", "--why", "w", "--falsifier", "f"]);
+  assert.equal(opened.status, 0, opened.stderr);
+  assert.equal(
+    readdirSync(join(fresh, "decisions")).filter((n) => n.endsWith(".json")).length, 1,
+    "it lands at the repository root, not in the subdirectory",
+  );
+  assert.match(opened.stdout, /opening a log for/, "opening a log is said out loud");
+});
+
+check("this checkout is recognised in either form, and rewritten not refused", () => {
+  // The same install writes two forms, so comparing the strings answers the
+  // wrong question: an adopter set up by the previous version was told their
+  // own hook was a different bosun, and re-running the installer - which is
+  // how the skill copy is refreshed - was blocked for all of them.
+  const project = mkdtempSync(join(tmpdir(), "bosun-reinstall-"));
+  scratch.push(project);
+  const checkout = join(project, "tools", "bosun");
+  mkdirSync(join(checkout, "hook"), { recursive: true });
+  mkdirSync(join(checkout, "skill"), { recursive: true });
+  mkdirSync(join(project, ".claude"), { recursive: true });
+  copyFileSync(join(SCRIPT_ROOT, "hook", "presence.sh"), join(checkout, "hook", "presence.sh"));
+  copyFileSync(join(SCRIPT_ROOT, "skill", "SKILL.md"), join(checkout, "skill", "SKILL.md"));
+  const layerName = basename(LAYER);
+  mkdirSync(join(checkout, layerName), { recursive: true });
+  for (const name of readdirSync(LAYER)) {
+    copyFileSync(join(LAYER, name), join(checkout, layerName, name));
+  }
+
+  const old = `sh "${join(checkout, "hook", "presence.sh")}"`;
+  const settingsPath = join(project, ".claude", "settings.json");
+  writeFileSync(settingsPath, JSON.stringify({
+    model: "opus",
+    hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: old }] }] },
+  }, null, 2), "utf8");
+
+  const run = spawnSync(process.execPath,
+    [join(checkout, layerName, `install${EXT}`), project, "--write"],
+    { encoding: "utf8", env: INSTALL_ENV });
+  assert.equal(run.status, 0, `must not refuse its own hook: ${run.stderr}`);
+  assert.doesNotMatch(run.stderr, /a different bosun/);
+
+  const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.equal(after.model, "opus", "everything else in the file survives");
+  const commands = after.hooks.UserPromptSubmit
+    .flatMap((group: { hooks: { command: string }[] }) => group.hooks)
+    .map((hook: { command: string }) => hook.command);
+  assert.deepEqual(commands, ['sh "$CLAUDE_PROJECT_DIR/tools/bosun/hook/presence.sh"'],
+    "the old form is rewritten, not duplicated beside the new one");
+
+  // Two registrations of this same checkout, in two spellings, must end as one.
+  // Modelling "at most one of ours" left the hook firing twice on every message
+  // for good: a file holding the current form beside an old one was reported as
+  // already registered, and a second odd spelling survived every run. Written
+  // against this very install, since that is the hook isOurs compares against.
+  const here = SCRIPT_ROOT;
+  const mine = hookCommand(here);
+  const absolute = `sh "${join(here, "hook", "presence.sh")}"`;
+  const braced = 'sh "${CLAUDE_PROJECT_DIR}/hook/presence.sh"';
+  const settled = reconcile({
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: "sh /unrelated.sh" }] }],
+      UserPromptSubmit: [
+        { hooks: [{ type: "command", command: mine }] },
+        { matcher: "keep me", hooks: [{ type: "command", command: "echo other" }] },
+        { hooks: [{ type: "command", command: absolute }] },
+        { hooks: [{ type: "command", command: braced }] },
+      ],
+    },
+  }, mine, here);
+  const left = (settled!.settings.hooks!.UserPromptSubmit ?? [])
+    .flatMap((group) => group.hooks ?? []).map((hook) => hook.command);
+  assert.deepEqual(left, [mine, "echo other"],
+    "one of ours survives, in the current form, and nothing else is disturbed");
+  assert.equal(settled!.had.length, 3, "all three spellings were recognised as ours");
+  assert.ok(settled!.settings.hooks!.Stop, "another event is untouched");
+  assert.equal((settled!.settings.hooks!.UserPromptSubmit ?? [])[1]?.matcher, "keep me",
+    "a matcher on somebody else\'s group survives");
+  assert.equal(
+    reconcile({ hooks: { UserPromptSubmit: [{ hooks: [{ command: mine }] }] } }, mine, here),
+    null, "exactly one, in the current form, is nothing to do");
+
+  // A group that arrived empty is somebody else\'s, and dropping it deleted
+  // their entry while the printed step promised to keep everything else. Only a
+  // group this pass emptied is this pass\'s to remove.
+  const untouched = reconcile({
+    hooks: {
+      UserPromptSubmit: [
+        { matcher: "someday", hooks: [] },
+        { matcher: "nokey" },
+        { hooks: [{ type: "command", command: mine }] },
+        { hooks: [{ type: "command", command: mine }] },
+      ],
+    },
+  }, mine, here);
+  const groups = untouched!.settings.hooks!.UserPromptSubmit ?? [];
+  assert.deepEqual(groups.map((group) => group.matcher),
+    ["someday", "nokey", undefined],
+    "both foreign groups survive; the duplicate of ours takes its group with it");
+  assert.equal(groups.filter((group) => (group.hooks ?? [])
+    .some((hook) => hook.command === mine)).length, 1, "ours is left once");
+
+  // A project path holding a $ made expanding the variable reintroduce one, so
+  // the guard against foreign variables rejected this install's own hook and
+  // every run appended it again.
+  assert.equal(namedHook('sh "$CLAUDE_PROJECT_DIR/hook/presence.sh"', "/a$b/proj"),
+    "/a$b/proj/hook/presence.sh", "a $ in the project is not a variable");
+  assert.equal(namedHook('sh "$OTHER/hook/presence.sh"', "/a$b/proj"), null,
+    "a variable this install cannot resolve still refuses");
+
+  // The filesystem here is case-insensitive and realpathSync leaves case alone,
+  // so comparing resolved paths told an adopter their own hook was a stranger.
+  const shouted = here.toUpperCase();
+  assert.equal(otherInstall(
+    { hooks: { UserPromptSubmit: [{ hooks: [{ command: mine }] }] } },
+    hookCommand(shouted), shouted), null,
+    "a project named in another case is still this same install");
+
+  // A genuinely different install is still a conflict, not a form to rewrite.
+  const foreign = `sh "/somewhere/else/bosun/hook/presence.sh"`;
+  assert.equal(otherInstall(
+    { hooks: { UserPromptSubmit: [{ hooks: [{ command: foreign }] }] } },
+    'sh "$CLAUDE_PROJECT_DIR/tools/bosun/hook/presence.sh"', project), foreign);
+  // A command still carrying a variable nothing here can resolve is not ours.
+  assert.equal(namedHook('sh "$SOMEWHERE/hook/presence.sh"', project), null);
+});
+
+check("the hook command travels with the project it is written into", () => {
+  // An absolute path names a machine. A settings.json is committed and cloned,
+  // and then names a directory that is not there - a hook failing on every
+  // message, in somebody else\'s checkout.
+  const inside = hookCommand(join(SCRIPT_ROOT, ".."));
+  assert.match(inside, /\$CLAUDE_PROJECT_DIR/, "a checkout inside the project is relative");
+  assert.match(inside, /hook\/presence\.sh"$/);
+  assert.doesNotMatch(inside, /\.\./, "never a path climbing out of the project");
+  assert.equal(hookCommand(SCRIPT_ROOT), 'sh "$CLAUDE_PROJECT_DIR/hook/presence.sh"',
+    "bosun installed into itself is the project, and travels the same way");
+  assert.match(hookCommand(mkdtempSync(join(tmpdir(), "bosun-outside-"))),
+    /^sh "\//, "outside the project the absolute path stays");
+
+  // A symlink anywhere above the project made relative() climb out with .. and
+  // the absolute path was written silently, on exactly the machines - /tmp on
+  // macOS, a managed home - the relative form exists for.
+  const over = join(SCRIPT_ROOT, "..");
+  const link = mkdtempSync(join(tmpdir(), "bosun-link-")) + "-to-parent";
+  symlinkSync(over, link);
+  scratch.push(link);
+  assert.equal(hookCommand(link), inside, "a symlinked root resolves the same way");
+  assert.equal(hookCommand(join(SCRIPT_ROOT, "..").toUpperCase()), inside,
+    "and so does one named in another case, on a case-insensitive filesystem");
+
+  // reconcile writes whatever it is handed, so the two cannot drift apart.
+  const merged = reconcile({}, inside, SCRIPT_ROOT)!.settings;
+  assert.equal(merged.hooks?.UserPromptSubmit?.[0]?.hooks?.[0]?.command, inside);
+});
+
+check("a script spawns its own layer, not the one it was built from", () => {
+  // dist/save.mjs used to spawn bin/render.ts, which needs the very type
+  // stripper dist exists to do without: on a plain node every save rendered
+  // nothing and named a file the adopter was never told about.
+  assert.ok(sibling("file:///x/dist/save.mjs", "render").endsWith("/dist/render.mjs"));
+  assert.ok(sibling("file:///x/bin/save.ts", "render").endsWith("/bin/render.ts"));
+
+  // The layer must not reach the generated files either: they are committed
+  // and read on other machines, so the install path of whoever rendered last
+  // is both a byte that flips on every checkout and a path nobody else has.
+  const project = projectDir("dir");
+  const gap = spawnSync(process.execPath, [tool("save"),
+    "--statement", "An entry with a gap", "--decision", "d"],
+    { cwd: project, encoding: "utf8" });
+  assert.equal(gap.status, 0, gap.stderr);
+  const pages = readdirSync(join(project, "decisions")).filter((n) => n.endsWith(".md"));
+  const rendered = pages.map((n) => readFileSync(join(project, "decisions", n), "utf8"));
+  assert.ok(rendered.some((text) => text.includes("Incomplete.")), "the gap is shown");
+  for (const text of [...rendered, readFileSync(join(project, "DECISIONS.md"), "utf8")]) {
+    assert.doesNotMatch(text, /bin\/save\.ts|dist\/save\.mjs --id [^`]*\n/, "no layer");
+    assert.ok(!text.includes(SCRIPT_ROOT), "no install path in a generated file");
+  }
+});
+
+check("an older document is sent to upgrade, and dedup renames only onto free ids", () => {
+  // save stamped a v2 entry to LATEST as it stood, skipping the id rewrites
+  // forever; render blamed a valid v6 field as "not allowed" - advice to
+  // delete data the migration converts. Both now point at upgrade instead.
+  const project = projectDir("dir");
+  const old = { schema: 6, id: "2026-01-01-00-00-00-000-utc", alias: "E1",
+    date: "2026-01-01", origin: "t", author_role: "human",
+    reason_type: "argued", statement: "Old", decision: "d", why: "w",
+    falsifier: "f", superseded_by: "E9", rejected: [], supersedes: [] };
+  writeFileSync(join(project, "decisions", "a.json"), JSON.stringify(old), "utf8");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script), ...args],
+      { cwd: project, encoding: "utf8" });
+  const touched = run("save", ["--id", "E1", "--note", "x"]);
+  assert.equal(touched.status, 1);
+  assert.match(touched.stderr, /schema v6\. Run upgrade/);
+  const rendered = run("render", []);
+  assert.equal(rendered.status, 1);
+  assert.match(rendered.stderr, /older than this checkout writes/);
+  assert.doesNotMatch(rendered.stderr, /superseded_by/, "no field is blamed");
+
+  // dedup: a rename that would land on a genuine sibling's id steps past it;
+  // an id with no numeric tail is refused before anything is written; entries
+  // with no id at all are a gap, not a crash.
+  const taken = [
+    { name: "a.json", entry: { id: "2026-01-01-00-00-00-000-utc", alias: "E1" } },
+    { name: "b.json", entry: { id: "2026-01-01-00-00-00-000-utc", alias: "E2" } },
+    { name: "c.json", entry: { id: "2026-01-01-00-00-00-001-utc", alias: "E3" } },
+  ];
+  const lines = deduplicate(taken as never);
+  assert.equal(taken[1].entry.id, "2026-01-01-00-00-00-002-utc",
+    "the rename steps past the taken sibling");
+  assert.equal(lines.length, 1);
+  assert.throws(
+    () => deduplicate([
+      { name: "a.json", entry: { id: "same-slug" } },
+      { name: "b.json", entry: { id: "same-slug" } },
+    ] as never),
+    /no numeric tail/,
+  );
+  assert.deepEqual(deduplicate([
+    { name: "a.json", entry: {} }, { name: "b.json", entry: {} },
+  ] as never), [], "no id is a gap, never a crash");
+
+  // A claimed version nothing ever shipped is named, not an ENOENT.
+  assert.throws(() => loadSchema(0), /schema v0 does not exist/);
+});
+
+check("a document from the future is refused by its version, not by its fields", () => {
+  // save and upgrade refused newer documents by name; render arrived at the
+  // same log without that gate and rendered a v(N+1) entry as if it were old,
+  // and where the newer entry carried a new field, the refusal blamed the
+  // field - advice that deletes it, the damage "refused rather than damaged"
+  // exists to prevent. fold metered what it could not read.
+  const future = complete({ schema: LATEST + 1, confidence: "high" });
+  const problems = validate(future, LATEST);
+  assert.equal(problems.length, 1, "the version gate speaks alone");
+  assert.match(problems[0].message, new RegExp(`v${LATEST + 1}.*up to v${LATEST}`));
+  assert.doesNotMatch(problems.map((one) => one.path).join(" "), /confidence/,
+    "no field of the newer schema is blamed");
+
+  const project = projectDir("dir");
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "layer\n", "utf8");
+  writeFileSync(join(project, "decisions", "future.json"),
+    JSON.stringify(complete({ schema: LATEST + 1,
+      id: "2026-01-01-00-00-00-000-utc", alias: "E1" })), "utf8");
+  for (const script of ["render", "fold"] as const) {
+    const out = spawnSync(process.execPath, [tool(script)],
+      { cwd: project, encoding: "utf8" });
+    assert.equal(out.status, 1, `${script} must refuse`);
+    assert.match(out.stderr, /knows up to v/);
+  }
+});
+
+check("a gap never blocks a migration, a defect always does", () => {
+  // v2 onwards allows an unfinished entry; v1 did not, which is why this
+  // starts there rather than at the beginning of the chain.
+  const [migrated] = walk(
+    complete({ schema: 2, id: "x", falsifier: null }), "gap.json");
+  assert.equal(migrated.schema, LATEST, "an unfinished entry still walks");
+  assert.throws(
+    () => walk(complete({ statement: 42 }), "broken.json"),
+    /expected string/,
+  );
+});
+
+check("save writes into a throwaway project and refuses a bad supersede", () => {
+  const project = projectDir("dir");
+  const run = (args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args], {
+      cwd: project,
+      encoding: "utf8",
+    });
+
+  const wrote = run(["--statement", "A decision", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]);
+  assert.equal(wrote.status, 0, wrote.stderr);
+  const written = readdirSync(join(project, "decisions"))
+    .filter((n) => n.endsWith(".json"));
+  assert.equal(written.length, 1);
+  const entry = JSON.parse(
+    readFileSync(join(project, "decisions", written[0]), "utf8"));
+  assert.equal(entry.origin, basename(project), "origin is the project");
+  assert.match(entry.id, /-utc$/);
+  assert.equal(entry.alias, null, "no short handle is minted, per E107");
+
+  // A single unknown target must leave every file untouched.
+  const before = readFileSync(join(project, "decisions", written[0]), "utf8");
+  const refused = run(["--statement", "Another", "--decision", "d",
+    "--why", "w", "--falsifier", "f",
+    "--supersedes", "a-decision", "--supersedes", "E404"]);
+  assert.equal(refused.status, 1, "should refuse");
+  assert.match(refused.stderr, /unknown entry: E404/);
+  assert.equal(
+    readFileSync(join(project, "decisions", written[0]), "utf8"), before,
+    "the first entry must not have been touched",
+  );
+
+  // A directory with no marker anywhere above it must refuse, not fall back
+  // into the bosun clone.
+  const nowhere = mkdtempSync(join(tmpdir(), "bosun-nomarker-"));
+  scratch.push(nowhere);
+  const outside = spawnSync(
+    process.execPath,
+    [tool("save"), "--statement", "Nowhere",
+      "--decision", "d"],
+    { cwd: nowhere, encoding: "utf8" },
+  );
+  assert.equal(outside.status, 1, "should refuse outside any log");
+  assert.match(outside.stderr, /no decisions\/ or DECISIONS\.md/);
+});
+
+check("render refuses to overwrite a DECISIONS.md it did not write", () => {
+  const project = projectDir("dir");
+  writeFileSync(join(project, "DECISIONS.md"), "# my own notes\n", "utf8");
+  const saved = spawnSync(process.execPath, [tool("save"),
+    "--statement", "A decision", "--decision", "d", "--why", "w",
+    "--falsifier", "f"], { cwd: project, encoding: "utf8" });
+  assert.equal(
+    readFileSync(join(project, "DECISIONS.md"), "utf8"), "# my own notes\n",
+    "a hand-written index must survive",
+  );
+  assert.match(saved.stderr, /refusing to overwrite/);
+  // The refusal must reach the exit code, or --check reports success while
+  // the index is stale.
+  const checked = spawnSync(process.execPath,
+    [tool("render"), "--check"],
+    { cwd: project, encoding: "utf8" });
+  assert.equal(checked.status, 1, "a refused index is not up to date");
+});
+
+check("a project marked only by DECISIONS.md gets its decisions directory", () => {
+  const project = projectDir("file");
+  const saved = spawnSync(process.execPath, [tool("save"),
+    "--statement", "A decision", "--decision", "d", "--why", "w",
+    "--falsifier", "f"], { cwd: project, encoding: "utf8" });
+  assert.equal(saved.status, 0, saved.stderr);
+  assert.equal(
+    readdirSync(join(project, "decisions")).filter((n) => n.endsWith(".json"))
+      .length,
+    1,
+  );
+});
+
+check("an adopter's index never carries this project's history", () => {
+  const project = projectDir("dir");
+  const saved = spawnSync(process.execPath, [tool("save"),
+    "--statement", "A decision", "--decision", "d", "--why", "w",
+    "--falsifier", "f"], { cwd: project, encoding: "utf8" });
+  assert.equal(saved.status, 0, saved.stderr);
+  const index = readFileSync(join(project, "DECISIONS.md"), "utf8");
+  assert.ok(index.startsWith(INDEX_MARKER), "generated index carries a marker");
+  assert.doesNotMatch(index, /E1 to E12/, "no borrowed autobiography");
+  assert.doesNotMatch(index, /OPEN\.md/, "no link to a file that is not there");
+});
+
+check("a superseded entry says how far it was superseded", () => {
+  const project = projectDir("dir");
+  const run = (args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args], {
+      cwd: project, encoding: "utf8" });
+  const save = (statement: string, extra: string[] = []) => {
+    const saved = run(["--statement", statement, "--decision", "d", "--why", "w",
+      "--falsifier", "f", ...extra]);
+    assert.equal(saved.status, 0, saved.stderr);
+  };
+
+  save("The old rule");
+  save("The narrow replacement",
+    ["--supersedes-part", "the-old-rule :: only the naming"]);
+  save("The total replacement", ["--supersedes", "narrow-replacement"]);
+
+  const read = (needle: string) =>
+    readFileSync(
+      join(project, "decisions",
+        readdirSync(join(project, "decisions"))
+          .find((n) => n.includes(needle) && n.endsWith(".md"))!),
+      "utf8",
+    );
+
+  // The extent lives on the successor, so the predecessor used to say only
+  // "superseded by", and a reader would retire rules that still hold.
+  const partly = read("the-old-rule");
+  assert.match(partly, /Superseded in part by [^.]*narrow-replacement/);
+  assert.match(partly, /only the naming/);
+  assert.match(partly, /Everything else in this entry still holds/);
+
+  const wholly = read("the-narrow-replacement");
+  assert.match(wholly, /Superseded by [^.]*total-replacement\./);
+  assert.match(wholly, /Nothing of this entry still holds/);
+
+  const index = readFileSync(join(project, "DECISIONS.md"), "utf8");
+  assert.match(index, /superseded \*\*in part\*\* by [^|]*narrow-replacement/);
+});
+
+check("the same content produces the same bytes, whatever the flag order", () => {
+  const write = (project: string, args: string[]) => {
+    const saved = spawnSync(process.execPath,
+      [tool("save"), ...args],
+      { cwd: project, encoding: "utf8" });
+    assert.equal(saved.status, 0, saved.stderr);
+    const dir = join(project, "decisions");
+    const file = readdirSync(dir).find((n) => n.endsWith(".json"))!;
+    return JSON.parse(readFileSync(join(dir, file), "utf8"));
+  };
+
+  // Same project name in different parents: origin is the project name by
+  // design, so comparing two differently named projects would prove nothing.
+  const twin = () => {
+    const dir = join(projectDir("dir"), "twin");
+    mkdirSync(join(dir, "decisions"), { recursive: true });
+    return dir;
+  };
+  const a = write(twin(), ["--statement", "Same content",
+    "--decision", "d", "--why", "w", "--falsifier", "f"]);
+  const b = write(twin(), ["--falsifier", "f", "--why", "w",
+    "--decision", "d", "--statement", "Same content"]);
+
+  // Key order is part of the bytes on disk, so it has to be the same too.
+  assert.deepEqual(Object.keys(a), Object.keys(b), "key order must not follow flag order");
+  for (const key of Object.keys(a)) {
+    if (key === "id" || key === "date") continue; // the clock, by design
+    assert.deepEqual(a[key], b[key], key);
+  }
+
+  // Rendering twice must not change a byte.
+  const project = projectDir("dir");
+  write(project, ["--statement", "Rendered twice", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]);
+  const render = () => {
+    spawnSync(process.execPath, [tool("render")],
+      { cwd: project, encoding: "utf8" });
+    return readFileSync(join(project, "DECISIONS.md"), "utf8");
+  };
+  assert.equal(render(), render(), "render must be byte-identical");
+});
+
+check("a field value can never begin a line, so it cannot forge structure", () => {
+  // Escaping a list of tokens lost to Markdown's block grammar: a note
+  // containing a bold line reading like the retirement banner rendered
+  // byte-identical to the real one. A value that cannot begin a line cannot
+  // begin a heading, a banner, a blockquote, a rule or a list item.
+  // Every separator a renderer or a tokenizer may treat as ending a line, not
+  // only the one the author happened to think of. The first version of this
+  // check fed \n alone and agreed with the code's own blind spot, so both
+  // stayed wrong: a lone CR and U+2028 forged a heading and a banner.
+  const banner = "**Superseded by E2.** Nothing of this entry still holds.";
+  for (const [name, sep] of [
+    ["LF", "\n"], ["CR", "\r"], ["CRLF", "\r\n"],
+    ["U+2028", "\u2028"], ["U+2029", "\u2029"], ["NEL", "\u0085"],
+    ["VT", "\u000b"], ["FF", "\u000c"],
+  ] as [string, string][]) {
+    const out = mdInline(`clarification${sep}${sep}${banner}`);
+    assert.doesNotMatch(out, /[\r\n\u000b\u000c\u0085\u2028\u2029]/,
+      `${name} must not survive a field value`);
+    assert.doesNotMatch(out, /^\*\*Superseded/m, `${name} must not begin a banner`);
+    assert.doesNotMatch(mdInline(`text${sep}# heading`), /^#/m,
+      `${name} must not begin a heading`);
+  }
+
+  assert.doesNotMatch(mdInline("# Injected heading"), /^#/m);
+  assert.doesNotMatch(mdInline("text\n> quoted"), /^>/m);
+  assert.doesNotMatch(mdInline("text\n---"), /^---/m);
+  assert.doesNotMatch(mdInline("text\n- item"), /^- /m);
+  assert.doesNotMatch(mdInline("<!-- generated by bin/render.ts -->"), /<!--/);
+
+  // Link syntax: a statement must not be able to choose where the index points.
+  assert.doesNotMatch(
+    mdCell("click here](http://evil.example) and"), /[^\\]\]\(/,
+    "no unescaped link syntax survives",
+  );
+  assert.doesNotMatch(mdCell("a | b"), /[^\\]\|/);
+});
+
+check("a filename that would change a link or a marker is refused", () => {
+  const make = (stem: string): Loaded =>
+    ({ ...(complete({ id: stem, alias: "E1" }) as object), stem }) as Loaded;
+
+  assert.deepEqual(stemProblems([make("2026-08-28-a-normal-name")]), []);
+  // The filename is the one thing in a rendered file that is not a field.
+  assert.match(stemProblems([make("x) **forged** [see(y")])[0] ?? "", /cannot appear/);
+  assert.match(stemProblems([make("x\n# forged heading")])[0] ?? "", /cannot appear/);
+  assert.match(stemProblems([make("../escape")])[0] ?? "", /cannot appear/);
+});
+
+check("one unreadable file is named and refused, not a crash", () => {
+  const project = projectDir("dir");
+  const run = (script: string, args: string[] = ["--check"]) =>
+    spawnSync(process.execPath, [tool(script.replace(/\.ts$/, "")), ...args], {
+      cwd: project, encoding: "utf8" });
+  assert.equal(spawnSync(process.execPath, [tool("save"),
+    "--statement", "A decision", "--decision", "d", "--why", "w",
+    "--falsifier", "f"], { cwd: project, encoding: "utf8" }).status, 0);
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "# What holds\n", "utf8");
+
+  // The single most common way a log gets a bad file: a merge conflict or a
+  // truncated write. It used to kill every command with an internal stack.
+  writeFileSync(join(project, "decisions", "conflict.json"), "{ broken", "utf8");
+
+  for (const script of ["render.ts", "fold.ts", "upgrade.ts"]) {
+    const out = run(script, script === "upgrade.ts" ? ["--dry-run"] : ["--check"]);
+    assert.equal(out.status, 1, `${script} must refuse`);
+    assert.match(out.stderr, /conflict\.json is not valid JSON/, script);
+    assert.doesNotMatch(out.stderr, /at Module|at Object\./, `${script}: no stack`);
+  }
+
+  // Saving an unrelated new entry must not die on a sibling it never needed.
+  const saved = run("save.ts", ["--statement", "Unrelated", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]);
+  assert.equal(saved.status, 1);
+  assert.match(saved.stderr, /conflict\.json is not valid JSON/);
+  assert.doesNotMatch(saved.stderr, /at Module|at Object\./);
+});
+
+check("valid JSON of the wrong shape is handled, never a crash", () => {
+  // The sibling check above feeds broken JSON syntax. This feeds the case it
+  // did not: a file that parses cleanly but is the wrong shape - an entry that
+  // omits an optional array the schema never required, a non-object where an
+  // entry belongs, a fold record whose folded field is not a list. readEntryFile
+  // guards syntax, not shape, and the consumers iterate these fields raw.
+  const project = projectDir("dir");
+  const dir = join(project, "decisions");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script.replace(/\.ts$/, "")), ...args],
+      { cwd: project, encoding: "utf8" });
+  const noStack = (out: { stderr: string }, who: string) => {
+    assert.doesNotMatch(out.stderr, /TypeError|is not iterable|is not a function/,
+      `${who} crashed on shape`);
+    assert.doesNotMatch(out.stderr, /\bat \w+ \(file:/, `${who} printed a stack`);
+  };
+
+  writeFileSync(join(dir, "ok.json"), JSON.stringify(complete(
+    { schema: LATEST, id: "2026-08-28-10-00-00-000-utc", alias: "E1" }), null, 2), "utf8");
+  // An entry an importer or a merge left without the optional arrays. It is
+  // schema-legal, so render must not crash and must not refuse it - it renders.
+  const imported = complete(
+    { schema: LATEST, id: "2026-08-28-11-00-00-000-utc", alias: "E2",
+      statement: "Imported from another tool" }) as Record<string, unknown>;
+  delete imported.supersedes;
+  delete imported.rejected;
+  writeFileSync(join(dir, "imported.json"), JSON.stringify(imported, null, 2), "utf8");
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "# holds\n", "utf8");
+
+  const rendered = run("render.ts", []);
+  noStack(rendered, "render");
+  assert.equal(rendered.status, 0, `render must accept a missing optional array: ${rendered.stderr}`);
+  assert.match(readFileSync(join(project, "DECISIONS.md"), "utf8"), /Imported from another tool/);
+
+  // A save of an unrelated entry auto-renders; that render must survive the
+  // shape-incomplete sibling, exactly as it must survive a syntactically bad one.
+  const saved = run("save.ts", ["--statement", "Unrelated", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]);
+  noStack(saved, "save");
+  assert.equal(saved.status, 0, `save must complete despite the sibling: ${saved.stderr}`);
+
+  // A fold record whose folded field is not a list is coerced to empty, not
+  // mapped over blindly: everything reads as pending, which is visible and safe.
+  writeFileSync(join(project, "fold-state.json"), '{"schema":1,"folded":"oops"}', "utf8");
+  const folded = run("fold.ts", ["--check"]);
+  noStack(folded, "fold");
+
+  // A non-object entry file is named and refused, never dragged through a sort.
+  writeFileSync(join(dir, "not-an-object.json"), "[]", "utf8");
+  const bad = run("render.ts", ["--check"]);
+  noStack(bad, "render non-object");
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /not-an-object\.json is not a decision object/);
+});
+
+check("render validates like the other tools, and says what it retires", () => {
+  const project = projectDir("dir");
+  const run = (args: string[]) =>
+    spawnSync(process.execPath, [tool("render"), ...args],
+      { cwd: project, encoding: "utf8" });
+  const save = (...args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args],
+      { cwd: project, encoding: "utf8" });
+
+  assert.equal(save("--statement", "A rule that binds", "--decision", "d",
+    "--why", "w", "--falsifier", "f").status, 0);
+
+  // Retiring outright is loud on the save path; a hand-added or imported
+  // entry never touches save, so render has to say it too.
+  const first = JSON.parse(readFileSync(join(project, "decisions",
+    readdirSync(join(project, "decisions")).find((n) => n.endsWith(".json"))!),
+    "utf8"));
+  writeFileSync(join(project, "decisions", "2026-08-28-cleanup.json"),
+    JSON.stringify({ ...first, id: "2026-08-28-23-59-59-999-utc", alias: "E2",
+      statement: "Tidy up", supersedes: [
+        { id: first.id, extent: "whole", detail: null }] }, null, 2), "utf8");
+  const rendered = run([]);
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /retired outright/, "a silent retirement is the finding");
+  assert.match(rendered.stdout, /a-rule-that-binds retired outright by E2/);
+
+  // A type-wrong field: upgrade and save both refused it, render did not.
+  writeFileSync(join(project, "decisions", "2026-08-28-typewrong.json"),
+    JSON.stringify({ ...first, id: "2026-08-28-23-59-58-000-utc", alias: "E3",
+      statement: "Wrong type", rejected: "not an array" }, null, 2), "utf8");
+  const refused = run(["--check"]);
+  assert.equal(refused.status, 1, "render must validate too");
+  assert.match(refused.stderr, /typewrong\.json: entry\.rejected/);
+});
+
+check("install refuses a settings file of the wrong shape, and keeps it", () => {
+  // Valid JSON is not a settings file. Both of these were silent destruction:
+  // a JSON string was spread character by character into an object, and a
+  // hooks array was replaced by an object.
+  assert.deepEqual(settingsProblems({}), []);
+  assert.deepEqual(settingsProblems({ model: "x" }), []);
+  assert.deepEqual(settingsProblems({ hooks: { Stop: [] } }), []);
+  assert.match(settingsProblems("a string")[0] ?? "", /not an object/);
+  assert.match(settingsProblems([])[0] ?? "", /an array/);
+  assert.match(settingsProblems(null)[0] ?? "", /not an object/);
+  assert.match(settingsProblems({ hooks: [] })[0] ?? "", /"hooks" is not an object/);
+  assert.match(
+    settingsProblems({ hooks: { UserPromptSubmit: {} } })[0] ?? "",
+    /UserPromptSubmit" is not an array/,
+  );
+  assert.match(
+    settingsProblems({ hooks: { UserPromptSubmit: [null] } })[0] ?? "",
+    /\[0\] is not an object/,
+  );
+  assert.match(
+    settingsProblems({ hooks: { UserPromptSubmit: [{ hooks: "x" }] } })[0] ?? "",
+    /\[0\]\.hooks is not an array/,
+  );
+
+  // End to end: the file on disk survives untouched.
+  const project = mkdtempSync(join(tmpdir(), "bosun-install-"));
+  scratch.push(project);
+  mkdirSync(join(project, ".claude"));
+  const held = '"important configuration nobody wants to lose"';
+  const path = join(project, ".claude", "settings.json");
+  writeFileSync(path, held, "utf8");
+  const out = spawnSync(process.execPath,
+    [tool("install"), project, "--write"],
+    { encoding: "utf8", env: INSTALL_ENV });
+  assert.equal(out.status, 1, "must refuse");
+  assert.equal(readFileSync(path, "utf8"), held, "the file must survive");
+  assert.doesNotMatch(out.stderr, /at Module|at Object\./, "no stack");
+
+  // A legitimate file still merges, keeping everything it had.
+  const fine = reconcile({ model: "opus", hooks: { Stop: [{ hooks: [] }] } },
+    "sh /x/hook/presence.sh", project)!.settings;
+  assert.equal(fine.model, "opus");
+  assert.ok(fine.hooks?.Stop, "an unrelated hook survives");
+  assert.ok(fine.hooks?.UserPromptSubmit, "ours is added");
+});
+
+check("a malformed hook entry is named, not a crash over the file", () => {
+  // The shape check validated that a group's hooks is an array, but not that
+  // its entries are objects - and otherInstall/alreadyThere read .command off
+  // each one. A [null] entry is valid JSON, passes the old check, then throws.
+  // What the earlier test fed - a group that is not an object, a hooks that is
+  // not an array - the code already handled; this is the leaf it did not.
+  assert.match(
+    settingsProblems({ hooks: { UserPromptSubmit: [{ hooks: [null] }] } })[0] ?? "",
+    /\[0\]\.hooks\[0\] is not an object/,
+  );
+  assert.match(
+    settingsProblems({ hooks: { UserPromptSubmit: [{ hooks: [42] }] } })[0] ?? "",
+    /\[0\]\.hooks\[0\] is not an object/,
+  );
+  // The twin one level deeper, inside the object: otherInstall calls .includes
+  // on .command, so a present non-string command is the same crash. An object
+  // entry with a numeric command was what the object-only check let through.
+  assert.match(
+    settingsProblems({
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: 42 }] }] },
+    })[0] ?? "",
+    /\[0\]\.hooks\[0\]\.command is not a string/,
+  );
+  // A hook object without a command is safe and must still pass.
+  assert.deepEqual(
+    settingsProblems({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command" }] }] } }),
+    [],
+  );
+  // A well-formed hook entry still passes.
+  assert.deepEqual(
+    settingsProblems({
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "x" }] }] },
+    }),
+    [],
+  );
+
+  // End to end: the file survives and the refusal names the shape, rather than
+  // reaching a caught TypeError.
+  const project = mkdtempSync(join(tmpdir(), "bosun-leaf-"));
+  scratch.push(project);
+  mkdirSync(join(project, ".claude"));
+  const held = '{"hooks":{"UserPromptSubmit":[{"hooks":[null]}]}}';
+  const path = join(project, ".claude", "settings.json");
+  writeFileSync(path, held, "utf8");
+  const out = spawnSync(process.execPath,
+    [tool("install"), project, "--write"],
+    { encoding: "utf8", env: INSTALL_ENV });
+  assert.equal(out.status, 1, "must refuse");
+  assert.equal(readFileSync(path, "utf8"), held, "the file must survive");
+  assert.match(out.stderr, /is not a settings file/, "refused by name");
+  assert.doesNotMatch(out.stderr, /Cannot read properties/, "not a caught crash");
+});
+
+check("a rule file with broken markers is refused, not silently rewritten", () => {
+  // spliceRule keys off a start and an end marker. A lone start plus the block
+  // a first run appends leaves two starts; the next run slices from the first
+  // start to the appended end and deletes everything between - the owner's
+  // text. An end before its start duplicates the span. Both are the class the
+  // settings file already refuses: guess at somebody else's file, silently.
+  const S = "<!-- bosun:start -->", E = "<!-- bosun:end -->";
+  assert.equal(markerProblem(""), null, "a clean file appends");
+  assert.equal(markerProblem("notes\n"), null, "plain content appends");
+  assert.equal(markerProblem(`a\n${S}\nx\n${E}\nb\n`), null, "one block replaces");
+  assert.match(markerProblem(`a\n${S}\nx\n`) ?? "", /markers this install cannot/);
+  assert.match(markerProblem(`a\n${E}\nx\n`) ?? "", /markers this install cannot/);
+  assert.match(markerProblem(`${E}\nm\n${S}\n`) ?? "", /out of order/);
+  assert.match(markerProblem(`${S}\n${S}\n${E}\n`) ?? "", /markers this install cannot/);
+
+  // spliceRule on a clean and a well-formed file is unchanged by the guard.
+  assert.match(spliceRule("", "R"), /^<!-- bosun:start -->\nR\n<!-- bosun:end -->\n$/);
+  assert.equal(spliceRule(`a\n${S}\nold\n${E}\nb\n`, "R"), `a\n${S}\nR\n${E}\nb\n`);
+
+  // End to end: a lone start marker with the owner's text below it. Two runs,
+  // and the text must still be there.
+  const project = mkdtempSync(join(tmpdir(), "bosun-marker-"));
+  scratch.push(project);
+  const rules = join(project, "AGENTS.md");
+  const owned = `top\n${S}\nMY IMPORTANT NOTES\nmore\n`;
+  writeFileSync(rules, owned, "utf8");
+  const run = () => spawnSync(process.execPath,
+    [tool("install"), project, "--agent", "codex", "--write"],
+    { encoding: "utf8", env: INSTALL_ENV });
+  const first = run();
+  assert.equal(first.status, 1, "the ambiguous file is refused");
+  assert.match(first.stderr, /markers this install cannot/);
+  run(); // a second run must not compound the damage
+  assert.equal(readFileSync(rules, "utf8"), owned, "the owner's text survives");
+});
+
+check("--agent rejects an inherited object key, not just an unknown one", () => {
+  // AGENTS[agent] resolved toString and constructor through the prototype, so
+  // the guard passed and install ran with an undefined binding. What the old
+  // check fed - "codex", "cursor", a plainly unknown name - it handled; the
+  // prototype keys are what it did not.
+  const project = mkdtempSync(join(tmpdir(), "bosun-agent-"));
+  scratch.push(project);
+  for (const name of ["toString", "constructor", "hasOwnProperty"]) {
+    const out = spawnSync(process.execPath,
+      [tool("install"), project, "--agent", name, "--write"],
+      { encoding: "utf8", env: INSTALL_ENV });
+    assert.equal(out.status, 1, `--agent ${name} must be refused`);
+    assert.match(out.stderr, /unknown --agent/, `--agent ${name} names it`);
+  }
+});
+
+check("waiting lists the standing wires and only those", () => {
+  // Every entry names its falsifier and nothing ever looked again - the first
+  // run of this reader over the real log surfaced a founding entry that had
+  // silently carried a test artifact for two days.
+  const project = projectDir("dir");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script), ...args],
+      { cwd: project, encoding: "utf8" });
+  const save = (args: string[]) => assert.equal(run("save", args).status, 0);
+  save(["--statement", "Armed one", "--decision", "d", "--why", "w",
+    "--falsifier", "we observe X"]);
+  save(["--statement", "Bare one", "--decision", "d", "--why", "w"]);
+  save(["--statement", "The retirer", "--decision", "d", "--why", "w",
+    "--falsifier", "f", "--supersedes", "armed-one"]);
+
+  const out = run("waiting", []);
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /1 standing entry waiting/,
+    "waiting counts the armed; the bare one stands apart");
+  assert.match(out.stdout, /the-retirer/);
+  assert.doesNotMatch(out.stdout.split("no falsifier yet")[0], /armed-one/,
+    "retired outright waits for nothing");
+  assert.match(out.stdout, /fires if:  f/);
+  assert.match(out.stdout, /no falsifier yet/);
+  assert.match(out.stdout, /bare-one/);
+  assert.match(out.stdout, /--supersedes-part/,
+    "the firing command is handed over");
+  assert.match(run("waiting", ["--chek"]).stderr, /unknown flag/);
+});
+
+check("print hands the rule over even where nothing is left to install", () => {
+  // It used to sit behind the install steps and answered "nothing to do" on
+  // any project already set up - exactly when somebody wants the text to
+  // paste into a tool this installer does not know.
+  const project = projectDir("dir");
+  const out = spawnSync(process.execPath,
+    [tool("install"), project, "--agent", "print"],
+    { encoding: "utf8", env: INSTALL_ENV });
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /\[bosun\]/, "the rule is printed");
+  assert.match(out.stdout, /No fork, no entry/, "all of it");
+  assert.doesNotMatch(out.stdout, /nothing to do/);
+});
+
+check("a codex install ignores an unrelated settings.json", () => {
+  // A codex or cursor install writes a rule file and never touches
+  // .claude/settings.json. Reading and shape-checking it there only blocks a
+  // job it has no part in: a wrong-shaped or unparseable settings.json - which
+  // this very install refuses on the claude path - must not stop an AGENTS.md
+  // write. This regressed the moment the shape check ran for every agent.
+  const run = (project: string, body: string) => {
+    mkdirSync(join(project, ".claude"));
+    writeFileSync(join(project, ".claude", "settings.json"), body, "utf8");
+    return spawnSync(process.execPath,
+      [tool("install"), project, "--agent", "codex", "--write"],
+      { encoding: "utf8", env: INSTALL_ENV });
+  };
+
+  const wrongShape = mkdtempSync(join(tmpdir(), "bosun-codex-"));
+  scratch.push(wrongShape);
+  const a = run(wrongShape, "[1, 2, 3]");
+  assert.equal(a.status, 0, "a wrong-shaped settings.json must not block codex");
+  assert.match(readFileSync(join(wrongShape, "AGENTS.md"), "utf8"), /bosun:start/);
+  assert.equal(readFileSync(join(wrongShape, ".claude", "settings.json"), "utf8"),
+    "[1, 2, 3]", "the settings.json codex never touches is untouched");
+
+  const unparseable = mkdtempSync(join(tmpdir(), "bosun-codex2-"));
+  scratch.push(unparseable);
+  const b = run(unparseable, "{ not json");
+  assert.equal(b.status, 0, "an unparseable settings.json must not block codex");
+  assert.match(readFileSync(join(unparseable, "AGENTS.md"), "utf8"), /bosun:start/);
+});
+
+check("install asks the node the commands name, and takes any that can run them", () => {
+  const fake = (line: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "bosun-node-"));
+    scratch.push(dir);
+    writeFileSync(join(dir, "node"),
+      `#!/bin/sh\nif [ "$1" = "-p" ]; then echo "${line}"; else exit 1; fi\n`,
+      { encoding: "utf8", mode: 0o755 });
+    return dir;
+  };
+  const install = (pathDir: string) => {
+    const project = projectDir("dir");
+    return spawnSync(process.execPath,
+      [tool("install"), project, "--write"],
+      { encoding: "utf8", env: { ...process.env, PATH: `${pathDir}:${process.env.PATH}` } });
+  };
+
+  // The scripts ship stripped, so a node without the type stripper is exactly
+  // the case this is for and must be accepted. Only a node too old to run the
+  // shipped modules is refused.
+  assert.equal(install(fake("22.22.1")).status, 0, "a plain node is fine");
+  const tooOld = install(fake("16.20.0"));
+  assert.equal(tooOld.status, 1, "an old node must refuse");
+  assert.match(tooOld.stderr, /16\.20\.0/);
+});
+
+check("what ships is what the source says, and runs on a plain node", () => {
+  // dist is generated and committed, so it drifts exactly like the rendered
+  // layer does, and the same kind of check has to catch it. Freshness can only
+  // be measured by stripping the source again, so on a node that cannot strip
+  // it is reported as unmeasured rather than tested with a tool that cannot
+  // run there.
+  const canStrip = typeof (nodeModule as { stripTypeScriptTypes?: unknown })
+    .stripTypeScriptTypes === "function";
+  if (canStrip) {
+    const built = spawnSync(process.execPath,
+      [tool("build"), "--check"], { encoding: "utf8" });
+    assert.equal(built.status, 0, `dist is behind the source:\n${built.stdout}`);
+  } else {
+    console.log("  note: this node cannot strip types, dist freshness not checked");
+  }
+
+  // And the shipped file has to work, not merely exist.
+  const project = projectDir("dir");
+  const saved = spawnSync(process.execPath,
+    [join(SCRIPT_ROOT, "dist/save.mjs"), "--statement", "From the shipped file",
+      "--decision", "d", "--why", "w", "--falsifier", "f"],
+    { cwd: project, encoding: "utf8" });
+  assert.equal(saved.status, 0, saved.stderr);
+  assert.equal(
+    readdirSync(join(project, "decisions")).filter((n) => n.endsWith(".json")).length,
+    1,
+  );
+});
+
+check("a generated file whose entry is gone is removed, not left behind", () => {
+  const project = projectDir("dir");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script.replace(/\.ts$/, "")), ...args],
+      { cwd: project, encoding: "utf8" });
+  const save = (statement: string) => {
+    const out = run("save.ts", ["--statement", statement, "--decision", "d",
+      "--why", "w", "--falsifier", "f"]);
+    assert.equal(out.status, 0, out.stderr);
+  };
+  save("First rule");
+  save("Second rule");
+
+  const dir = join(project, "decisions");
+  const gone = readdirSync(dir).find((n) => n.includes("second") && n.endsWith(".json"))!;
+  rmSync(join(dir, gone));
+
+  // Rendering used to correct the index and leave the page, and --check then
+  // reported clean because it only compared files that ought to exist.
+  const checked = run("render.ts", ["--check"]);
+  assert.equal(checked.status, 1, "a file with no entry behind it is drift");
+  assert.match(checked.stdout, /no entry behind it any more/);
+
+  assert.equal(run("render.ts", []).status, 0);
+  assert.equal(
+    readdirSync(dir).filter((n) => n.includes("second")).length, 0,
+    "the orphaned page is removed",
+  );
+  assert.equal(run("render.ts", ["--check"]).status, 0);
+});
+
+check("an empty log is legitimate, its leftovers are not", () => {
+  const fresh = projectDir("dir");
+  const run = (project: string, args: string[]) =>
+    spawnSync(process.execPath, [tool("render"), ...args],
+      { cwd: project, encoding: "utf8" });
+
+  // A project that has decided nothing yet is not an error.
+  const quiet = run(fresh, ["--check"]);
+  assert.equal(quiet.status, 0, "an empty log is fine");
+  assert.match(quiet.stdout, /nothing to render/);
+
+  // A log that was emptied is another matter: the index outlived it and kept
+  // pointing at a page that is gone.
+  const project = projectDir("dir");
+  assert.equal(spawnSync(process.execPath, [tool("save"),
+    "--statement", "The only rule", "--decision", "d", "--why", "w",
+    "--falsifier", "f"], { cwd: project, encoding: "utf8" }).status, 0);
+  for (const name of readdirSync(join(project, "decisions"))) {
+    if (name.endsWith(".json")) rmSync(join(project, "decisions", name));
+  }
+  const stale = run(project, ["--check"]);
+  assert.equal(stale.status, 1, "an index that outlived its log is drift");
+  assert.match(stale.stdout, /outlived the log/);
+
+  assert.equal(run(project, []).status, 0);
+  assert.equal(existsSync(join(project, "DECISIONS.md")), false,
+    "the dead index is removed");
+});
+
+check("a script reached through a symlink still runs", () => {
+  // Node canonicalises import.meta.url but not process.argv[1], so comparing
+  // them raw made every script exit 0 without doing anything when reached
+  // through a symlinked path.
+  const dir = mkdtempSync(join(tmpdir(), "bosun-link-"));
+  scratch.push(dir);
+  const link = join(dir, "link-to-bin");
+  symlinkSync(LAYER, link);
+
+  const project = projectDir("dir");
+  const run = (script: string) =>
+    spawnSync(process.execPath, [join(script, `render${EXT}`), "--check"], {
+      cwd: project, encoding: "utf8" });
+  spawnSync(process.execPath, [tool("save"),
+    "--statement", "A decision", "--decision", "d", "--why", "w",
+    "--falsifier", "f"], { cwd: project, encoding: "utf8" });
+
+  const direct = run(LAYER);
+  const through = run(link);
+  assert.match(direct.stdout, /entries/, "direct run reports");
+  assert.match(through.stdout, /entries/, "a symlinked path must not no-op");
+  assert.equal(isDirectRun(new URL("file://" + join(SCRIPT_ROOT, "bin/x.ts")).href), false);
+});
+
+check("a supersede link that cannot be true is refused, not rendered", () => {
+  const log = (over: Record<string, unknown>[]): Loaded[] =>
+    over.map((one, index) => ({
+      ...(complete({ id: `id-${index}`, alias: `E${index + 1}` }) as object),
+      ...one,
+      stem: `s-${index}`,
+    })) as Loaded[];
+
+  assert.deepEqual(linkProblems(log([{}, {}])), []);
+
+  const dangling = linkProblems(
+    log([{}, { supersedes: [{ id: "E404", extent: "whole", detail: null }] }]),
+  );
+  assert.match(dangling[0] ?? "", /not in the log/);
+
+  const itself = linkProblems(
+    log([{ supersedes: [{ id: "E1", extent: "whole", detail: null }] }]),
+  );
+  assert.match(itself[0] ?? "", /supersedes itself/);
+
+  // A part link with no detail renders the literal word null in the banner.
+  const empty = linkProblems(
+    log([{}, { supersedes: [{ id: "E1", extent: "part", detail: null }] }]),
+  );
+  assert.match(empty[0] ?? "", /without saying what was replaced/);
+});
+
+check("a misspelled flag is refused, not ignored", () => {
+  // includes() matching meant --chekc ran the command as if nothing had been
+  // asked: a check that reported nothing checked, silence meaning fine. And
+  // --bootstrap without --done printed the listing and recorded nothing while
+  // whoever typed it believed a sweep was recorded.
+  assert.equal(unknownFlag(["--check"], ["--check"]), null);
+  assert.equal(unknownFlag(["--chekc"], ["--check"]), "--chekc");
+  assert.equal(unknownFlag(["a", "--done"], ["--done"]), null, "bare words pass");
+  assert.equal(unknownFlag(["--log=x"], ["--log"]), null, "=value forms match");
+
+  const project = projectDir("dir");
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "layer\n", "utf8");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script), ...args],
+      { cwd: project, encoding: "utf8", env: INSTALL_ENV });
+  for (const [script, flag] of [
+    ["fold", "--chekc"], ["render", "--chek"], ["upgrade", "--dry"],
+  ] as const) {
+    const out = run(script, [flag]);
+    assert.equal(out.status, 1, `${script} must refuse ${flag}`);
+    assert.match(out.stderr, /unknown flag/);
+  }
+  assert.match(run("install", [project, "--wirte"]).stderr, /unknown flag/);
+  const swept = run("fold", ["--bootstrap"]);
+  assert.equal(swept.status, 1);
+  assert.match(swept.stderr, /--bootstrap only records with --done/);
+});
+
+check("fold refuses the log render refuses, and a record with problems", () => {
+  // Metering a log with two entries under one handle counted one where the
+  // log holds two, so a new decision was neither pending nor recorded; and a
+  // read-back over a record naming a nonexistent entry certified the record
+  // instead of surfacing it - stamping every impossible line as read.
+  const project = projectDir("dir");
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "layer\n", "utf8");
+  const entry = (id: string, alias: string, statement: string) =>
+    JSON.stringify({ schema: LATEST, id, alias, date: id.slice(0, 10),
+      origin: "t", author_role: "human", reason_type: "argued",
+      statement, decision: "d", why: "w", falsifier: "f",
+      rejected: [], supersedes: [] });
+  const dir = join(project, "decisions");
+  writeFileSync(join(dir, "a.json"),
+    entry("2026-01-01-00-00-00-000-utc", "E1", "First"), "utf8");
+  writeFileSync(join(dir, "b.json"),
+    entry("2026-01-01-00-00-00-000-utc", "E1", "Second"), "utf8");
+  const fold = (args: string[]) =>
+    spawnSync(process.execPath, [tool("fold"), ...args],
+      { cwd: project, encoding: "utf8" });
+  const collided = fold(["--check"]);
+  assert.equal(collided.status, 1, "a colliding log is refused, not metered");
+  assert.match(collided.stderr, /a\.json and b\.json both answer to E1/);
+
+  rmSync(join(dir, "b.json"));
+  writeFileSync(join(project, FOLD_STATE), JSON.stringify({
+    schema: 1,
+    folded: [
+      { id: "2026-01-01-00-00-00-000-utc", at: "2026-01-02-00-00-00-000-utc", how: "unchecked" },
+      { id: "9999-01-01-00-00-00-000-utc", at: "2025-01-01-00-00-00-000-utc", how: "unchecked" },
+    ],
+  }), "utf8");
+  const stamped = fold(["--checked-by", "carol"]);
+  assert.equal(stamped.status, 1, "problems block the stamp");
+  assert.match(stamped.stderr, /is recorded as folded but is not in the log/);
+
+  // A clean read-back stamps who, never when: rewriting at erased the
+  // at-before-entry evidence the status check exists to catch.
+  writeFileSync(join(project, FOLD_STATE), JSON.stringify({
+    schema: 1,
+    folded: [{ id: "2026-01-01-00-00-00-000-utc", at: "2026-01-02-00-00-00-000-utc", how: "unchecked" }],
+  }), "utf8");
+  const read = fold(["--checked-by", "carol"]);
+  assert.equal(read.status, 0, read.stderr);
+  const record = (JSON.parse(readFileSync(join(project, FOLD_STATE), "utf8")) as FoldState).folded[0];
+  assert.equal(record.at, "2026-01-02-00-00-00-000-utc", "the fold's time stays");
+  assert.equal(record.by, "carol");
+
+  // "--checked-by E1" is a forgotten name, not a reader called E1.
+  assert.match(fold(["--checked-by", "E1"]).stderr ?? "", /looks like an entry handle/);
+
+  // A state file the tool cannot trust is named and refused, never a crash,
+  // and one from a newer checkout is refused rather than silently downgraded.
+  writeFileSync(join(project, FOLD_STATE), '{"schema":1,"folded":[null]}', "utf8");
+  const shape = fold(["--check"]);
+  assert.equal(shape.status, 1);
+  assert.match(shape.stderr, /not \{id, at, how\}/);
+  assert.doesNotMatch(shape.stderr, /Cannot read properties/);
+  writeFileSync(join(project, FOLD_STATE), '{"schema":2,"folded":[]}', "utf8");
+  assert.match(fold(["--check"]).stderr ?? "", /schema v2, this checkout knows up to v1/);
+
+  // One entry, one record: a merge resolved by keeping both sides said an
+  // entry was simultaneously read back and never read back.
+  writeFileSync(join(project, FOLD_STATE), JSON.stringify({
+    schema: 1,
+    folded: [
+      { id: "2026-01-01-00-00-00-000-utc", at: "2026-01-02-00-00-00-000-utc", how: "folded", by: "x" },
+      { id: "2026-01-01-00-00-00-000-utc", at: "2026-01-03-00-00-00-000-utc", how: "unchecked" },
+    ],
+  }), "utf8");
+  const doubled = fold(["--check"]);
+  assert.equal(doubled.status, 1);
+  assert.match(doubled.stdout + doubled.stderr, /recorded 2 times/);
+});
+
+check("a ring of whole links is refused, and a marker without a directory is cleaned", () => {
+  // Two entries retiring each other outright rendered as a truth that cannot
+  // be - both pages said nothing of them still holds - and the fold would
+  // then have dropped both from the layer.
+  const project = projectDir("dir");
+  const dir = join(project, "decisions");
+  const entry = (i: string, other: string) =>
+    JSON.stringify({ schema: LATEST, id: `2026-01-0${i}-00-00-00-000-utc`,
+      alias: `E${i}`, date: `2026-01-0${i}`, origin: "t",
+      author_role: "human", reason_type: "argued", statement: `Number ${i}`,
+      decision: "d", why: "w", falsifier: "f", rejected: [],
+      supersedes: [{ id: `E${other}`, extent: "whole", detail: null }] });
+  writeFileSync(join(dir, "e2.json"), entry("2", "3"), "utf8");
+  writeFileSync(join(dir, "e3.json"), entry("3", "2"), "utf8");
+  const rendered = spawnSync(process.execPath, [tool("render")],
+    { cwd: project, encoding: "utf8" });
+  assert.equal(rendered.status, 1, "the ring must refuse");
+  assert.match(rendered.stderr, /a ring in which nothing still holds/);
+
+  // A DECISIONS.md whose decisions/ is gone is the empty log the cleanup
+  // branch handles; the raw ENOENT made that branch unreachable.
+  const bare = mkdtempSync(join(tmpdir(), "bosun-bare-"));
+  scratch.push(bare);
+  writeFileSync(join(bare, "DECISIONS.md"),
+    "<!-- generated by bin/render.ts -->\n", "utf8");
+  const cleaned = spawnSync(process.execPath, [tool("render")],
+    { cwd: bare, encoding: "utf8" });
+  assert.equal(cleaned.status, 0, cleaned.stderr);
+  assert.doesNotMatch(cleaned.stderr, /ENOENT/);
+  assert.ok(!existsSync(join(bare, "DECISIONS.md")), "the orphaned index goes");
+});
+
+check("a fold nobody read back is recorded as unchecked", () => {
+  const project = projectDir("dir");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script.replace(/\.ts$/, "")), ...args], {
+      cwd: project, encoding: "utf8" });
+  assert.equal(run("save.ts", ["--statement", "A decision", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]).status, 0);
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "# What holds\n", "utf8");
+
+  assert.equal(run("fold.ts", ["--done"]).status, 0);
+  const stamped = readFoldState(join(project, FOLD_STATE));
+  assert.equal(stamped.folded[0].how, "unchecked",
+    "stamping your own fold is not a checked fold");
+  assert.match(run("fold.ts", ["--check"]).stdout, /never read back/);
+
+  assert.equal(run("fold.ts", ["--checked-by", "someone else"]).status, 0);
+  const read = readFoldState(join(project, FOLD_STATE));
+  assert.equal(read.folded[0].how, "folded");
+  assert.equal(read.folded[0].by, "someone else");
+  assert.doesNotMatch(run("fold.ts", ["--check"]).stdout, /never read back/);
+});
+
+check("the fold record names every entry, so nothing hides behind it", () => {
+  const log: Loaded[] = ["one", "two", "three"].map((id, index) => ({
+    ...(complete({ id, alias: `E${index + 1}` }) as object),
+    stem: id,
+  })) as Loaded[];
+  const record = (ids: string[], how = "folded"): FoldState => ({
+    schema: 1,
+    folded: ids.map((id) => ({ id, at: "2026-08-28-00-00-00-000-utc", how })),
+  }) as FoldState;
+
+  // Nothing recorded: everything is pending.
+  const fresh = status(log, EMPTY_STATE);
+  assert.equal(fresh.pending.length, 3);
+  assert.equal(fresh.unrecorded, true);
+  assert.deepEqual(fresh.problems, []);
+
+  // Two recorded leaves exactly the third pending.
+  assert.deepEqual(
+    status(log, record(["one", "two"])).pending.map((one) => one.id),
+    ["three"],
+  );
+
+  // The gap is named, not merely counted: an entry recorded out of order
+  // leaves the skipped one pending by name rather than as a mismatch.
+  assert.deepEqual(
+    status(log, record(["one", "three"])).pending.map((one) => one.id),
+    ["two"],
+  );
+
+  // A record naming an id the log does not hold is damage, not a gap.
+  assert.match(
+    status(log, record(["gone"])).problems[0] ?? "",
+    /not in the log/,
+  );
+
+  // How an entry arrived survives, so a sweep never passes for a real fold.
+  assert.deepEqual(
+    status(log, record(["one", "two", "three"], "bootstrap")).bootstrapped,
+    ["one", "two", "three"],
+  );
+});
+
+check("fold records what was folded and check notices it falling behind", () => {
+  const project = projectDir("dir");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script.replace(/\.ts$/, "")), ...args], {
+      cwd: project,
+      encoding: "utf8",
+    });
+  const save = (statement: string, extra: string[] = []) => {
+    const saved = run("save.ts", ["--statement", statement, "--decision", "d",
+      "--why", "w", "--falsifier", "f", ...extra]);
+    assert.equal(saved.status, 0, saved.stderr);
+  };
+
+  save("First decision");
+
+  // The compressed layer is never generated: without it, --done refuses.
+  const refused = run("fold.ts", ["--done"]);
+  assert.equal(refused.status, 1, "no WHAT-HOLDS.md to record against");
+  assert.match(refused.stderr, /write it first/);
+
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "# What holds\n", "utf8");
+  assert.equal(run("fold.ts", ["--check"]).status, 1, "unrecorded is behind");
+  assert.equal(run("fold.ts", ["--done"]).status, 0);
+  assert.equal(run("fold.ts", ["--check"]).status, 0, "recorded is current");
+
+  // The record lives beside the layer, never inside it.
+  const holds = readFileSync(join(project, "WHAT-HOLDS.md"), "utf8");
+  assert.equal(holds, "# What holds\n", "the compressed layer is untouched");
+  const state = readFoldState(join(project, FOLD_STATE));
+  assert.equal(state.folded.length, 1);
+  assert.equal(state.folded[0].how, "unchecked", "nobody read it back yet");
+
+  // A new entry puts the layer behind; the listing carries the entry itself.
+  save("Second decision");
+  const checked = run("fold.ts", ["--check"]);
+  assert.equal(checked.status, 1, "a new entry is pending");
+  assert.match(checked.stdout, /Second decision/);
+  const listed = run("fold.ts", []);
+  assert.match(listed.stdout, /Second decision/);
+  assert.doesNotMatch(listed.stdout, /--- E1 ---/, "no decision read twice");
+  assert.equal(run("fold.ts", ["--done"]).status, 0);
+  assert.equal(run("fold.ts", ["--check"]).status, 0);
+
+  // A backdated entry sorts in behind the others and must be named, not
+  // merely counted. It arrives by hand or by import - save refuses --date -
+  // which is also how it arrives in reality.
+  writeFileSync(
+    join(project, "decisions", "2020-01-01-backdated-decision.json"),
+    JSON.stringify(
+      complete({
+        schema: LATEST,
+        id: "2020-01-01-00-00-00-000-utc",
+        alias: "E99",
+        date: "2020-01-01",
+        statement: "Backdated decision",
+      }),
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+  const behind = run("fold.ts", ["--check"]);
+  assert.equal(behind.status, 1, "a backdated entry is not silently folded");
+  assert.match(behind.stdout, /Backdated decision/);
+
+  // A sweep is recorded as a sweep.
+  assert.equal(run("fold.ts", ["--done", "--bootstrap"]).status, 0);
+  const swept = readFoldState(join(project, FOLD_STATE));
+  assert.equal(swept.folded.filter((one) => one.how === "bootstrap").length, 1);
+
+  // A rebuild lists every entry, says what it costs, and clears the sweep.
+  const listing = run("fold.ts", ["--rebuild"]);
+  assert.match(listing.stdout, /First decision/, "a rebuild reads everything");
+  assert.match(listing.stdout, /Backdated decision/);
+  assert.match(listing.stdout, /Rebuilding reads all 3 entries/);
+
+  assert.equal(run("fold.ts", ["--done", "--rebuild"]).status, 0);
+  const rebuilt = readFoldState(join(project, FOLD_STATE));
+  assert.equal(rebuilt.folded.length, 3, "the record is replaced, not grown");
+  assert.equal(
+    rebuilt.folded.filter((one) => one.how === "bootstrap").length, 0,
+    "a rebuild clears what was only swept in",
+  );
+  assert.equal(run("fold.ts", ["--check"]).status, 0);
+
+  // The two are opposites and must not be combined.
+  const both = run("fold.ts", ["--done", "--rebuild", "--bootstrap"]);
+  assert.equal(both.status, 1);
+  assert.match(both.stderr, /opposite things/);
+});
+
+check("slugify can never produce a path component", () => {
+  // The statement reaches the filename through slugify, so slugify is the
+  // guarantee that it cannot carry a separator or a traversal step.
+  const hostile = [
+    "../../../tmp/entkommen",
+    "..\\..\\windows",
+    "a/b/../c",
+    "a\0b",
+    "..",
+    ". . .",
+    "façade/../x",
+  ];
+  for (const text of hostile) {
+    const slug = slugify(text);
+    assert.match(slug, /^[a-z0-9-]*$/, text);
+    assert.ok(!slug.includes("/") && !slug.includes("\\"), text);
+    assert.ok(!slug.includes(".."), text);
+  }
+});
+
+check("a typo in the required flag names the stray, and a written machine path is said out loud", () => {
+  // --statment was refused (nothing written), but the message named only the
+  // missing --statement; the writer went hunting for a flag they were sure
+  // they had typed. The schema knows the stray by name.
+  const project = projectDir("dir");
+  const typo = spawnSync(process.execPath,
+    [tool("save"), "--statment", "typo", "--decision", "d"],
+    { cwd: project, encoding: "utf8" });
+  assert.equal(typo.status, 1);
+  assert.match(typo.stderr, /--statement is required/);
+  assert.match(typo.stderr, /entry\.statment not allowed/);
+
+  // And the installer says at write time when a committed file now names this
+  // machine - the README's reasoning arrived only for the inside-the-project
+  // case, while the outside case wrote the home path silently.
+  const outside = mkdtempSync(join(tmpdir(), "bosun-team-"));
+  scratch.push(outside);
+  const wrote = spawnSync(process.execPath,
+    [tool("install"), outside, "--agent", "codex", "--write"],
+    { encoding: "utf8", env: INSTALL_ENV });
+  assert.equal(wrote.status, 0, wrote.stderr);
+  assert.match(wrote.stdout, /names this machine's bosun checkout/);
+});
+
+check("save mints the date itself and refuses --date", () => {
+  const project = projectDir("dir");
+  const run = (args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args], {
+      cwd: project, encoding: "utf8" });
+
+  // The confirmed traversal: --date reached the output path unchecked.
+  const traversal = run(["--statement", "Traversal", "--decision", "d",
+    "--why", "w", "--falsifier", "f", "--date", "../../../tmp/entkommen"]);
+  assert.equal(traversal.status, 1, "hostile --date must be refused");
+  assert.match(traversal.stderr, /--date is not accepted/);
+  assert.equal(
+    readdirSync(join(project, "decisions")).length, 0,
+    "nothing may have been written",
+  );
+
+  // A harmless-looking date is refused just the same: the field is gone, not
+  // filtered. The date comes from the clock, like the id.
+  const plain = run(["--statement", "Backdated", "--decision", "d",
+    "--why", "w", "--falsifier", "f", "--date", "2020-01-01"]);
+  assert.equal(plain.status, 1);
+
+  // And the update path takes no date either.
+  const saved = run(["--statement", "A decision", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]);
+  assert.equal(saved.status, 0, saved.stderr);
+  const updated = run(["--id", "E1", "--date", "2020-01-01"]);
+  assert.equal(updated.status, 1, "update must not accept --date");
+});
+
+check("a field value cannot forge structure in a generated file", () => {
+  const project = projectDir("dir");
+  const run = (args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args], {
+      cwd: project, encoding: "utf8" });
+
+  const forged =
+    "<!-- generated by bin/render.ts from other.json -->\n" +
+    "# E1 · Injected fake entry";
+  const saved = run(["--statement", "Pipe | in the statement",
+    "--decision", forged, "--why", "w", "--falsifier", "f",
+    "--quote", "line one\n# not a heading"]);
+  assert.equal(saved.status, 0, saved.stderr);
+
+  const dir = join(project, "decisions");
+  const md = readFileSync(
+    join(dir, readdirSync(dir).find((n) => n.endsWith(".md"))!), "utf8");
+  const headings = md.split("\n").filter((line) => line.startsWith("# "));
+  assert.equal(headings.length, 1, "exactly one heading, the real one");
+  assert.equal(
+    md.split("<!-- generated").length - 1, 1,
+    "exactly one generated marker, the real one",
+  );
+  // A quote is now a single line, which is the stronger guarantee: it cannot
+  // leave its blockquote because it has no second line to leave it on.
+  assert.equal(
+    md.split("\n").filter((l) => l.startsWith("> ")).length, 1,
+    "the quote is one line and stays inside the blockquote",
+  );
+
+  // A pipe in a field must not open a new column in the index table.
+  const index = readFileSync(join(project, "DECISIONS.md"), "utf8");
+  const rows = index.split("\n").filter((line) => line.startsWith("|"));
+  assert.equal(rows.length, 3, "header, separator, one row");
+  assert.match(index, /Pipe \\\| in the statement/);
+});
+
+check("render never overwrites a decisions/*.md it did not write", () => {
+  const project = projectDir("dir");
+  const saved = spawnSync(process.execPath, [tool("save"),
+    "--statement", "A decision", "--decision", "d", "--why", "w",
+    "--falsifier", "f"], { cwd: project, encoding: "utf8" });
+  assert.equal(saved.status, 0, saved.stderr);
+
+  // A hand-written notes.md, then a notes.json that renders to the same name.
+  const mine = "# my own notes\n";
+  writeFileSync(join(project, "decisions", "notes.md"), mine, "utf8");
+  writeFileSync(
+    join(project, "decisions", "notes.json"),
+    JSON.stringify(complete({
+      schema: LATEST, id: "notes-x", alias: "E90", statement: "Notes",
+    }), null, 2) + "\n",
+    "utf8",
+  );
+
+  const rendered = spawnSync(process.execPath,
+    [tool("render")], { cwd: project, encoding: "utf8" });
+  assert.equal(rendered.status, 1, "a refused file is not success");
+  assert.match(rendered.stderr, /refusing to overwrite/);
+  assert.equal(
+    readFileSync(join(project, "decisions", "notes.md"), "utf8"), mine,
+    "the hand-written file must survive",
+  );
+  const checked = spawnSync(process.execPath,
+    [tool("render"), "--check"],
+    { cwd: project, encoding: "utf8" });
+  assert.equal(checked.status, 1, "a refused file is not up to date");
+});
+
+check("install writes inside the project it was pointed at, or refuses", () => {
+  const outside = mkdtempSync(join(tmpdir(), "bosun-outside-"));
+  scratch.push(outside);
+  const outsideSettings = join(outside, "settings.json");
+  writeFileSync(outsideSettings, "{}\n", "utf8");
+  const install = (project: string) =>
+    spawnSync(process.execPath,
+      [tool("install"), project, "--write"],
+      { encoding: "utf8", env: INSTALL_ENV });
+
+  // settings.json is a symlink to a file outside the project.
+  const trapped = mkdtempSync(join(tmpdir(), "bosun-symlink-"));
+  scratch.push(trapped);
+  mkdirSync(join(trapped, ".claude"));
+  symlinkSync(outsideSettings, join(trapped, ".claude", "settings.json"));
+  const refused = install(trapped);
+  assert.equal(refused.status, 1, "must refuse, not follow");
+  assert.match(refused.stderr, /outside/);
+  assert.equal(
+    readFileSync(outsideSettings, "utf8"), "{}\n",
+    "the symlink target must be untouched",
+  );
+
+  // The whole .claude directory is a symlink out of the project.
+  const trapped2 = mkdtempSync(join(tmpdir(), "bosun-symlink2-"));
+  scratch.push(trapped2);
+  symlinkSync(outside, join(trapped2, ".claude"));
+  const refused2 = install(trapped2);
+  assert.equal(refused2.status, 1);
+  assert.match(refused2.stderr, /outside/);
+});
+
+check("the hook prints a placeholder for a path it cannot print safely", () => {
+  const dir = mkdtempSync(join(tmpdir(), "bosun-hookpath-"));
+  scratch.push(dir);
+  // A newline injects a line into every message; $( ) evaluates if an agent
+  // runs the printed command.
+  const evil = join(dir, "x$(touch pwned)\ny");
+  mkdirSync(join(evil, "hook"), { recursive: true });
+  copyFileSync(
+    join(SCRIPT_ROOT, "hook", "presence.sh"),
+    join(evil, "hook", "presence.sh"),
+  );
+  const ran = spawnSync("sh", [join(evil, "hook", "presence.sh")], {
+    encoding: "utf8",
+  });
+  assert.equal(ran.status, 0, ran.stderr);
+  assert.ok(!ran.stdout.includes("$(touch"), "no substitution in the output");
+  assert.ok(!ran.stdout.includes(evil), "the raw path is not printed");
+  assert.match(ran.stdout, /placeholder/);
+});
+
+check("a space in the install path is quoted, not placeholdered and not split", () => {
+  // The guard placeholders what a shell would evaluate; a plain space is none
+  // of that, but the printed commands were unquoted, so a checkout under
+  // "My Projects" printed commands that split into pieces when an agent ran
+  // them - node looked for a module called .../My.
+  const spaced = mkdtempSync(join(tmpdir(), "bosun-spaced-"));
+  scratch.push(spaced);
+  const holder = join(spaced, "My Projects");
+  mkdirSync(holder);
+  symlinkSync(SCRIPT_ROOT, join(holder, "bosun"));
+  const emitted = spawnSync("sh",
+    [join(holder, "bosun", "hook", "presence.sh")], { encoding: "utf8" });
+  assert.equal(emitted.status, 0);
+  assert.doesNotMatch(emitted.stdout, /<path to your bosun checkout>/,
+    "a space is not unsafe, only unquoted");
+  assert.match(emitted.stdout, /node "[^"]*My Projects[^"]*dist\/save\.mjs"/,
+    "the printed command quotes the path");
+});
+
+check("a whole-extent supersede is loud at the moment it happens", () => {
+  const project = projectDir("dir");
+  const run = (args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args], {
+      cwd: project, encoding: "utf8" });
+  const base = run(["--statement", "The honesty rule", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]);
+  assert.equal(base.status, 0, base.stderr);
+
+  const part = run(["--statement", "A narrow replacement", "--decision", "d",
+    "--why", "w", "--falsifier", "f",
+    "--supersedes-part", "honesty-rule :: only the naming"]);
+  assert.equal(part.status, 0, part.stderr);
+  assert.doesNotMatch(part.stderr, /RETIRED OUTRIGHT/,
+    "a part link retires nothing");
+
+  const whole = run(["--statement", "A total replacement", "--decision", "d",
+    "--why", "w", "--falsifier", "f", "--supersedes", "narrow-replacement"]);
+  assert.equal(whole.status, 0, whole.stderr);
+  assert.match(whole.stderr, /RETIRED OUTRIGHT: .*a-narrow-replacement/);
+  assert.match(whole.stderr, /--supersedes-part/,
+    "the warning names the way back");
+});
+
+check("a hand-written fold record cannot pass as a verified fold", () => {
+  const project = projectDir("dir");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script.replace(/\.ts$/, "")), ...args], {
+      cwd: project, encoding: "utf8" });
+  assert.equal(run("save.ts", ["--statement", "A decision", "--decision", "d",
+    "--why", "w", "--falsifier", "f"]).status, 0);
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "# What holds\n", "utf8");
+  const dir = join(project, "decisions");
+  const entry = JSON.parse(readFileSync(
+    join(dir, readdirSync(dir).find((n) => n.endsWith(".json"))!), "utf8"));
+  const statePath = join(project, FOLD_STATE);
+  const forge = (record: Record<string, unknown>) =>
+    writeFileSync(statePath, JSON.stringify(
+      { schema: 1, folded: [record] }, null, 2) + "\n", "utf8");
+
+  // A record from before the entry existed cannot be true.
+  forge({ id: entry.id, at: "2000-01-01-00-00-00-000-utc", how: "folded",
+    by: "Diligent Reviewer" });
+  const impossible = run("fold.ts", ["--check"]);
+  assert.equal(impossible.status, 1, "an impossible record is a problem");
+  assert.match(impossible.stderr, /before the entry existed/);
+
+  // A "how" this tool never writes is a hand edit and says so.
+  forge({ id: entry.id, at: utcId(new Date()), how: "sworn" });
+  const strange = run("fold.ts", ["--check"]);
+  assert.equal(strange.status, 1);
+  assert.match(strange.stderr, /never writes/);
+
+  // A well-formed forgery passes every mechanical check - and the output
+  // says exactly what that means: recorded, not verified.
+  forge({ id: entry.id, at: utcId(new Date()), how: "folded",
+    by: "Diligent Reviewer" });
+  const green = run("fold.ts", ["--check"]);
+  assert.equal(green.status, 0);
+  assert.match(green.stdout, /recorded, not verified/);
+  assert.doesNotMatch(green.stdout, /compressed layer is current/,
+    "a green check must not present the record as a verified fold");
+});
+
+check("two entries answering to one handle are refused, and can be repaired", () => {
+  const foreign = projectDir("dir");
+  const mine = projectDir("dir");
+  const save = (project: string, statement: string, ...extra: string[]) =>
+    spawnSync(
+      process.execPath,
+      [tool("save"), "--statement", statement,
+        "--decision", "d", "--why", "w", "--falsifier", "f", ...extra],
+      { cwd: project, encoding: "utf8" },
+    );
+  // Logs written before E107 issued E-numbers, and every such log's first
+  // entry was E1 - so a file copied between old logs collides by default.
+  // Written directly, because save mints no alias and accepts none.
+  const legacy = (project: string, stem: string, statement: string,
+    ms: string) =>
+    writeFileSync(join(project, "decisions", `${stem}.json`), JSON.stringify({
+      schema: LATEST, id: `2026-01-05-09-00-00-${ms}-utc`, alias: "E1",
+      date: "2026-01-05", origin: basename(project), author_role: "human",
+      reason_type: "argued", statement, decision: "d", why: "w",
+      falsifier: "f", rejected: [], supersedes: [] }), "utf8");
+  legacy(foreign, "2026-01-05-made-somewhere-else", "Made somewhere else", "111");
+  legacy(mine, "2026-01-05-made-here", "Made here", "222");
+
+  const carried = readdirSync(join(foreign, "decisions"))
+    .filter((n) => n.endsWith(".json"))[0];
+  const landed = join(mine, "decisions", carried);
+  writeFileSync(landed,
+    readFileSync(join(foreign, "decisions", carried), "utf8"), "utf8");
+
+  const render = (project: string) =>
+    spawnSync(process.execPath, [tool("render")],
+      { cwd: project, encoding: "utf8" });
+
+  const refused = render(mine);
+  assert.equal(refused.status, 1, "two entries under one handle must refuse");
+  assert.match(refused.stderr, /both answer to E1/);
+  assert.match(refused.stderr, /origin/,
+    "the refusal must say which entry came from where");
+  // The local entry's page was written by its own save and belongs there; what
+  // must not appear is a page for the entry that caused the refusal.
+  assert.equal(
+    existsSync(join(mine, "decisions", carried.replace(/\.json$/, ".md"))),
+    false, "nothing is written while anything is refused");
+
+  // The message names a repair, so the repair has to work: the incomer sets
+  // its number down - a number this log never issued would be a citation
+  // nothing ever made. What travels keeps its id, its date and its origin.
+  const brought = JSON.parse(readFileSync(landed, "utf8"));
+  const before = { id: brought.id, date: brought.date, origin: brought.origin };
+  writeFileSync(landed,
+    JSON.stringify({ ...brought, alias: null }, null, 2) + "\n", "utf8");
+  assert.equal(render(mine).status, 0, "setting the number down settles it");
+  const after = JSON.parse(readFileSync(landed, "utf8"));
+  assert.deepEqual(
+    { id: after.id, date: after.date, origin: after.origin }, before,
+    "an entry from elsewhere keeps what says where and when it came from",
+  );
+  assert.notEqual(after.origin, basename(mine), "origin must not be rewritten");
+
+  // And an entry saved today cannot collide with anything: it carries no
+  // handle at all, per E107.
+  assert.equal(save(mine, "Made here later").status, 0);
+  const aliases = readdirSync(join(mine, "decisions"))
+    .filter((n) => n.endsWith(".json"))
+    .map((n) => JSON.parse(
+      readFileSync(join(mine, "decisions", n), "utf8")).alias)
+    .sort();
+  assert.deepEqual(aliases, ["E1", null, null],
+    "the local legacy number stays, the incomer and the new entry carry none");
+});
+
+check("a reader stamps what they answered for, not everything waiting", () => {
+  const project = projectDir("dir");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script.replace(/\.ts$/, "")), ...args], {
+      cwd: project, encoding: "utf8" });
+  for (const what of ["First", "Second", "Third"]) {
+    assert.equal(run("save.ts", ["--statement", `${what} decision`,
+      "--decision", "d", "--why", "w", "--falsifier", "f"]).status, 0);
+  }
+  writeFileSync(join(project, "WHAT-HOLDS.md"), "# What holds\n", "utf8");
+  assert.equal(run("fold.ts", ["--done"]).status, 0);
+
+  const how = () => {
+    const held = JSON.parse(
+      readFileSync(join(project, "fold-state.json"), "utf8"));
+    const word = new Map(
+      readdirSync(join(project, "decisions"))
+        .filter((n) => n.endsWith(".json"))
+        .map((n) => {
+          const e = JSON.parse(
+            readFileSync(join(project, "decisions", n), "utf8"));
+          return [e.id, /first|second|third/.exec(n)?.[0]] as [string, string];
+        }));
+    return Object.fromEntries(
+      held.folded.map((one: { id: string; how: string }) =>
+        [word.get(one.id), one.how]));
+  };
+  assert.deepEqual(how(),
+    { first: "unchecked", second: "unchecked", third: "unchecked" });
+
+  // A reader who could answer for two of three must be able to say so. The
+  // stamp used to cover everything waiting, which left only two moves: claim
+  // the third was read, or throw away two real verifications.
+  const some = run("fold.ts",
+    ["--checked-by", "A Cold Reader", "first-decision", "third"]);
+  assert.equal(some.status, 0, some.stderr);
+  assert.deepEqual(how(),
+    { first: "folded", second: "unchecked", third: "folded" },
+    "fragments name the entries, and only the named may be stamped");
+  assert.match(some.stdout, /1 still waiting/);
+
+  // Naming something that is not waiting is a mistake worth stopping for, not
+  // something to absorb quietly.
+  assert.equal(run("fold.ts", ["--checked-by", "X", "E404"]).status, 1);
+  assert.equal(run("fold.ts", ["--checked-by", "X", "first-decision"]).status,
+    1, "already read back, so naming it again is a mistake");
+  assert.equal(run("fold.ts", ["--checked-by", "X", "decision"]).status, 1,
+    "a fragment matching several entries is refused, not guessed between");
+  assert.deepEqual(how(),
+    { first: "folded", second: "unchecked", third: "folded" });
+
+  // Naming nobody still means everybody, which is the common case.
+  assert.equal(run("fold.ts", ["--checked-by", "Another Reader"]).status, 0);
+  assert.deepEqual(how(),
+    { first: "folded", second: "folded", third: "folded" });
+});
+
+check("the breaker's eight: resolution is closed and the id inherits the claim", () => {
+  // A breaker agent attacked E107 and found eight neighbours. Each lives on
+  // here as the check that fails against the code before its fix.
+  const project = projectDir("dir");
+  const dir = join(project, "decisions");
+  const run = (script: string, args: string[]) =>
+    spawnSync(process.execPath, [tool(script), ...args],
+      { cwd: project, encoding: "utf8" });
+  const file = (stem: string, over: Record<string, unknown>) =>
+    writeFileSync(join(dir, `${stem}.json`), JSON.stringify({
+      schema: LATEST, date: "2026-01-05", origin: "t", author_role: "human",
+      reason_type: "argued", statement: "x", decision: "d", why: "w",
+      falsifier: "f", rejected: [], supersedes: [], alias: null, ...over,
+    }), "utf8");
+
+  // B1: a target with no id cannot be linked - the fragment used to be
+  // written to disk in its place.
+  file("2026-01-05-imported-thing", { id: undefined, statement: "Imported" });
+  const linkless = run("save", ["--statement", "Replaces it", "--decision",
+    "d", "--why", "w", "--falsifier", "f",
+    "--supersedes-part", "imported :: x"]);
+  assert.equal(linkless.status, 1);
+  assert.match(linkless.stderr, /has no id yet/);
+  rmSync(join(dir, "2026-01-05-imported-thing.json"));
+
+  // B2: two files under one id - save refuses instead of updating whichever
+  // the directory lists first, and render calls it what it is.
+  file("2026-01-05-first-arrival", { id: "2026-01-05-10-00-00-000-utc" });
+  file("2026-01-05-second-arrival", { id: "2026-01-05-10-00-00-000-utc" });
+  const twice = run("save", ["--id", "2026-01-05-10-00-00-000-utc",
+    "--note", "which one?"]);
+  assert.equal(twice.status, 1);
+  assert.match(twice.stderr, /both answer to/);
+  assert.match(run("render", []).stderr, /The same entry landed twice/);
+  rmSync(join(dir, "2026-01-05-second-arrival.json"));
+
+  // B4: a lowercase legacy alias is the alias, never a fragment of some stem.
+  file("2026-01-05-old-legacy", { id: "2026-01-05-09-00-00-000-utc",
+    alias: "E9", statement: "Old legacy" });
+  file("2026-01-06-use-e9-chip", { id: "2026-01-06-09-00-00-000-utc",
+    date: "2026-01-06", statement: "Use e9 chip" });
+  const lower = run("save", ["--id", "e9", "--note", "z"]);
+  assert.equal(lower.status, 0, lower.stderr);
+  assert.match(lower.stdout, /updated E9 \(2026-01-05-09-00-00-000-utc\)/,
+    "e9 resolves to the alias E9, not to a stem containing e9");
+
+  // B5: the empty reference names everything and nothing.
+  const empty = run("save", ["--statement", "Oops", "--decision", "d",
+    "--why", "w", "--falsifier", "f", "--supersedes", ""]);
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /an empty reference/);
+
+  // B3: the id inherits the claim the alias had - parallel saves in one
+  // millisecond used to both pass the read-check and both report "wrote".
+  const race = projectDir("dir");
+  const script = tool("save");
+  const burst = spawnSync("sh", ["-c",
+    Array.from({ length: 8 }, (unused, i) =>
+      `${JSON.stringify(process.execPath)} ${JSON.stringify(script)} ` +
+        `--statement "Race ${i}" --decision d --why w --falsifier f ` +
+        `>/dev/null 2>&1 &`).join(" ") + " wait"],
+    { cwd: race, encoding: "utf8" });
+  assert.equal(burst.status, 0);
+  const ids = readdirSync(join(race, "decisions"))
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(
+      readFileSync(join(race, "decisions", name), "utf8")).id);
+  assert.equal(ids.length, 8, "every save landed");
+  assert.equal(new Set(ids).size, 8, "no two saves share an id");
+
+  // B6 + B7: a reader name that names an entry is refused before anything is
+  // stamped, with or without a selection - and a selection resolves by id
+  // fragment exactly as save does.
+  writeFileSync(join(race, "WHAT-HOLDS.md"), "layer\n", "utf8");
+  const fold = (args: string[]) =>
+    spawnSync(process.execPath, [tool("fold"), ...args],
+      { cwd: race, encoding: "utf8" });
+  assert.equal(fold(["--done"]).status, 0);
+  const slip = fold(["--checked-by", "race-0"]);
+  assert.equal(slip.status, 1);
+  assert.match(slip.stderr, /names an entry, not a reader/);
+  const byId = fold(["--checked-by", "A Person", ids[0].slice(11, 23)]);
+  assert.equal(byId.status, 0, byId.stderr);
+  assert.match(byId.stdout, /1 fold\(s\) read back/);
+});
+
+check("a reference is any unique fragment, and no new handle exists to collide", () => {
+  // E107: the id is the only identity. A fragment of the stem or id resolves
+  // wherever a reference is taken, an ambiguous one is refused with all
+  // matches named, what reaches disk is always the full id, and E-numbers
+  // ever issued keep resolving.
+  const project = projectDir("dir");
+  const run = (args: string[]) =>
+    spawnSync(process.execPath, [tool("save"), ...args],
+      { cwd: project, encoding: "utf8" });
+  assert.equal(run(["--statement", "We use sqlite over postgres",
+    "--decision", "d", "--why", "w", "--falsifier", "f"]).status, 0);
+  // A legacy file keeps its alias; save itself accepts none - --alias minted
+  // through the back door and, being an exact match, hijacked every fragment
+  // that happened to spell it.
+  const minted = run(["--statement", "Sneaky", "--decision", "d",
+    "--why", "w", "--falsifier", "f", "--alias", "cache"]);
+  assert.equal(minted.status, 1);
+  assert.match(minted.stderr, /--alias is not accepted/);
+  writeFileSync(join(project, "decisions", "2026-01-05-we-use-vendored-assets.json"),
+    JSON.stringify({ schema: LATEST, id: "2026-01-05-09-00-00-000-utc",
+      alias: "E9", date: "2026-01-05", origin: "t", author_role: "human",
+      reason_type: "argued", statement: "We use vendored assets",
+      decision: "d", why: "w", falsifier: "f", rejected: [],
+      supersedes: [] }), "utf8");
+
+  // Fragment resolves; the stored link carries the id, not the fragment.
+  const linked = run(["--statement", "Third thing", "--decision", "d",
+    "--why", "w", "--falsifier", "f", "--supersedes-part",
+    "sqlite-over :: the engine choice"]);
+  assert.equal(linked.status, 0, linked.stderr);
+  const files = readdirSync(join(project, "decisions"))
+    .filter((n) => n.endsWith(".json"));
+  const byStem = (needle: string) => JSON.parse(readFileSync(
+    join(project, "decisions", files.find((n) => n.includes(needle))!),
+    "utf8"));
+  const sqlite = byStem("sqlite");
+  assert.equal(byStem("third").supersedes[0].id, sqlite.id,
+    "disk holds the id, never the fragment");
+
+  // An ambiguous fragment is refused with the matches named.
+  const vague = run(["--id", "we-use", "--note", "x"]);
+  assert.equal(vague.status, 1);
+  assert.match(vague.stderr, /matches 2 entries/);
+  assert.match(vague.stderr, /Say more of the name/);
+
+  // The issued E-number and a unique fragment both still resolve.
+  assert.equal(run(["--id", "E9", "--note", "by legacy handle"]).status, 0);
+  assert.equal(run(["--id", "vendored", "--note", "by fragment"]).status, 0);
+});
+
+for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+
+console.log(
+  failures === 0 ? "\nall checks passed" : `\n${failures} check(s) failed`,
+);
+process.exitCode = failures === 0 ? 0 : 1;

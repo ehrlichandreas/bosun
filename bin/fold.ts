@@ -1,0 +1,605 @@
+#!/usr/bin/env node
+/**
+ * Meter the fold that keeps WHAT-HOLDS.md the compressed form of the log.
+ *
+ * E3 makes the state a projection of the chronicle, and O7 fixed its shape:
+ * new state = f(state, entry), so no decision is read twice. The prose that
+ * binds cannot be generated from fields - that would be a template twin of the
+ * log, the very thing E3 rejected - so the fold itself is written by whoever
+ * is working, usually the agent. This script owns everything mechanical around
+ * that judgement: which entries have been folded, which are still pending, and
+ * when the compressed layer has fallen behind.
+ *
+ *   node bin/fold.ts             print the entries not yet folded, and the rules
+ *   node bin/fold.ts --done      record the fold once it is written
+ *   node bin/fold.ts --checked-by NAME [E12 E13 ...]   record who read it back
+ *                                 with no entries named, all that were waiting
+ *   node bin/fold.ts --check     exit 1 if the compressed layer is behind
+ *   node bin/fold.ts --rebuild   print every entry, to fold the layer anew
+ *   node bin/fold.ts --done --rebuild   replace the record with a full fold
+ *
+ * What has been folded is recorded in fold-state.json beside WHAT-HOLDS.md,
+ * one line per entry, never inside the compressed layer itself. The layer must
+ * stay small because it is read on every turn; the record may grow. Keeping it
+ * out also keeps WHAT-HOLDS.md free of numbers, as its own first rule demands.
+ *
+ * The record is an attestation, not evidence. This script verifies what it
+ * can - that every recorded id exists, that nothing in the log is missing
+ * from the record, that no record claims a fold from before its entry
+ * existed - and only records the rest: that a fold was written, and who read
+ * it back. A hand-edited record passes everything the script can check, which
+ * is why its diffs deserve the same reading as any other claim in this
+ * repository, and why --check says "recorded", never "verified".
+ *
+ * A rebuild reads the whole log, which is exactly the cost the fold exists to
+ * avoid, so it is deliberate and rare rather than routine. It is also what
+ * makes the layer a projection at all: an incremental fold alone is path
+ * dependent, and a file nobody can recompute cannot be checked against the log.
+ */
+
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { load, type Loaded } from "./render.ts";
+import {
+  logRoot,
+  takeLog,
+  unknownFlag,
+  sibling,
+  noLogRoot,
+  decisionsDir,
+  readEntryFile,
+} from "./paths.ts";
+import { isDirectRun } from "./paths.ts";
+import { utcId, ID_FORMAT } from "./save.ts";
+import { LATEST } from "./schema.ts";
+
+export const FOLD_STATE = "fold-state.json";
+export const STATE_SCHEMA = 1;
+
+/**
+ * How an entry entered the compressed layer.
+ *
+ * "folded" was read back by somebody who did not write the fold. "unchecked"
+ * was folded and stamped by its own writer, which the rules call not done -
+ * the writer is the one person guaranteed to believe the nuance survived.
+ * "bootstrap" was swept in when the record was introduced, at which point
+ * WHAT-HOLDS.md was already hand-maintained and nobody could certify entry by
+ * entry that it held.
+ *
+ * The distinction is kept rather than smoothed over. Skipping the second
+ * reader is allowed - a solo maintainer has no other option - but it is
+ * recorded, so an unread fold cannot pass for a read one.
+ */
+export type How = "folded" | "unchecked" | "bootstrap";
+
+export type FoldRecord = {
+  id: string;
+  at: string;
+  how: How;
+  /** Who read the fold back. Absent for unchecked and bootstrap. */
+  by?: string;
+};
+export type FoldState = { schema: number; folded: FoldRecord[] };
+
+export const EMPTY_STATE: FoldState = { schema: STATE_SCHEMA, folded: [] };
+
+export function readFoldState(path: string): FoldState {
+  if (!existsSync(path)) return EMPTY_STATE;
+  const raw = readEntryFile(path);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(
+      `${FOLD_STATE} is not a fold record. Fix or move it, then run again.`,
+    );
+  }
+  const held = raw as unknown as FoldState;
+  // A record written by a newer checkout is refused, not silently stamped
+  // down to this shape on the next write. Same rule as save and upgrade.
+  const schema = held.schema ?? STATE_SCHEMA;
+  if (typeof schema !== "number" || schema > STATE_SCHEMA) {
+    throw new Error(
+      `${FOLD_STATE} is schema v${String(schema)}, this checkout knows up to ` +
+        `v${STATE_SCHEMA}`,
+    );
+  }
+  // A hand-edit or a merge conflict can leave folded a non-array; status()
+  // maps over it, so coerce rather than crash. A corrupt record then reads as
+  // "nothing folded", which surfaces every entry as pending - visible and safe.
+  const folded = Array.isArray(held.folded) ? held.folded : [];
+  // An element of the wrong shape crashed every command with an unnamed
+  // "Cannot read properties of null" - the stack trace over a bad file this
+  // tool promises never to produce.
+  for (const one of folded) {
+    if (
+      one === null || typeof one !== "object" || Array.isArray(one) ||
+      typeof (one as FoldRecord).id !== "string" ||
+      typeof (one as FoldRecord).at !== "string"
+    ) {
+      throw new Error(
+        `${FOLD_STATE} holds a record that is not {id, at, how}. ` +
+          `Fix or move it, then run again.`,
+      );
+    }
+  }
+  return { schema, folded };
+}
+
+function label(entry: Loaded): string {
+  // The E-number where one was ever issued; the stem - date plus slug, which
+  // says what was decided - since E107 stopped minting them. Both resolve.
+  return entry.alias ?? entry.stem ?? entry.id;
+}
+
+export type Status = {
+  /** Entries the compressed layer does not contain yet, in log order. */
+  pending: Loaded[];
+  /** Anything that makes the record untrustworthy. Fatal for --check. */
+  problems: string[];
+  /** True when nothing has ever been recorded as folded. */
+  unrecorded: boolean;
+  /** Entries swept in at bootstrap rather than folded on purpose. */
+  bootstrapped: string[];
+  /** Entries whose fold nobody but its writer has read. */
+  unchecked: string[];
+};
+
+/**
+ * Compare the log against the fold record.
+ *
+ * Because the record names every entry rather than counting them, an entry
+ * added behind the last fold - a backdated date, an import from another
+ * project - shows up as pending by name instead of as an unexplained mismatch.
+ */
+export function status(entries: Loaded[], state: FoldState): Status {
+  const known = new Map(state.folded.map((one) => [one.id, one]));
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const problems: string[] = [];
+  for (const record of state.folded) {
+    const entry = byId.get(record.id);
+    if (!entry) {
+      problems.push(
+        `${record.id} is recorded as folded but is not in the log. ` +
+          `The log never deletes, so either the record or the log is damaged.`,
+      );
+      continue;
+    }
+    if (!["folded", "unchecked", "bootstrap"].includes(record.how)) {
+      problems.push(
+        `${record.id} is recorded with how "${record.how}", which this ` +
+          `tool never writes. The record was edited by hand.`,
+      );
+    }
+    // Both are the same frozen timestamp format, so they compare as strings.
+    // A fold recorded from before its entry existed cannot be true; it is the
+    // signature of a record written by hand to keep an entry out of pending.
+    if (
+      ID_FORMAT.test(record.id) &&
+      ID_FORMAT.test(record.at) &&
+      record.at < record.id
+    ) {
+      problems.push(
+        `${record.id} is recorded as folded at ${record.at}, before the ` +
+          `entry existed. That fold cannot have happened.`,
+      );
+    }
+  }
+
+  // One entry, one record: a merge conflict resolved by keeping both sides
+  // left an entry simultaneously read back and never read back, and the count
+  // exceeded the log with nothing said.
+  const counted = new Map<string, number>();
+  for (const record of state.folded) {
+    counted.set(record.id, (counted.get(record.id) ?? 0) + 1);
+  }
+  for (const [id, times] of counted) {
+    if (times > 1) {
+      problems.push(`${id} is recorded ${times} times. One entry, one record.`);
+    }
+  }
+
+  return {
+    pending: entries.filter((entry) => !known.has(entry.id)),
+    problems,
+    unrecorded: state.folded.length === 0,
+    bootstrapped: state.folded
+      .filter((one) => one.how === "bootstrap")
+      .map((one) => one.id),
+    unchecked: state.folded
+      .filter((one) => one.how === "unchecked")
+      .map((one) => one.id),
+  };
+}
+
+/** Printed ahead of a rebuild listing, where the cost has to be visible. */
+function rebuildWarning(count: number): string {
+  return `Rebuilding reads all ${count} entries, which is the cost the fold ` +
+    `exists to avoid. Do it when the layer has drifted, when a cold reader ` +
+    `found something missing, or to clear entries that were only swept in - ` +
+    `not as a matter of routine.\n\nWrite WHAT-HOLDS.md from scratch against ` +
+    `everything below. The previous version is in git; compare against it ` +
+    `before recording, and account for anything you dropped.`;
+}
+
+/** The rules of the fold, printed with every pending listing. */
+const RULES = `Fold each entry above into WHAT-HOLDS.md. State, not chronicle:
+no numbers, nothing that can be wrong tomorrow. An entry superseded in whole
+is retired and does not appear in WHAT-HOLDS.md; a part link replaces only
+what its detail
+names, and the rest of the earlier entry still holds. Never copy an entry in -
+compress it: what binds, not what happened.
+
+Then the check that notices a dropped nuance, which no script can perform:
+someone who did not write the fold answers, from WHAT-HOLDS.md alone, the
+question each folded entry answers. If they cannot, the fold is not done.
+
+When it holds, record it:
+
+  node ${sibling(import.meta.url, "fold")} --done`;
+
+export function main(passed: string[]): number {
+  const { rest: argv, from } = takeLog(passed);
+  const unknown = unknownFlag(argv, [
+    "--check", "--done", "--bootstrap", "--rebuild", "--checked-by",
+  ]);
+  if (unknown) {
+    console.error(`refused: unknown flag ${unknown}`);
+    return 1;
+  }
+  const check = argv.includes("--check");
+  const done = argv.includes("--done");
+  const bootstrap = argv.includes("--bootstrap");
+  const rebuild = argv.includes("--rebuild");
+  // Alone it did nothing and said nothing: the listing was printed, exit 0,
+  // and whoever typed it believed a sweep had been recorded.
+  if (bootstrap && !done) {
+    console.error("refused: --bootstrap only records with --done");
+    return 1;
+  }
+  const checkedIndex = argv.indexOf("--checked-by");
+  const checkedBy = checkedIndex === -1 ? null : argv[checkedIndex + 1];
+  if (checkedIndex !== -1 && (!checkedBy || checkedBy.startsWith("--"))) {
+    console.error("--checked-by needs a name");
+    return 1;
+  }
+  // "--checked-by E1" is a forgotten name, not a reader called E1: taking it
+  // as one recorded the failed read-back it was meant to prevent, as done by
+  // nobody identifiable. Since E107 made stems the handles, the same slip
+  // arrives as "--checked-by cache-policy" - checked below, once the entries
+  // are loaded, because only they say what names an entry.
+  if (checkedBy && /^E\d+$/.test(checkedBy)) {
+    console.error(
+      `refused: --checked-by ${checkedBy} looks like an entry handle, not a ` +
+        `reader. The name comes first: --checked-by "who read it" ${checkedBy}`,
+    );
+    return 1;
+  }
+  // Anything after the name is the selection of what that reader actually
+  // answered for. Empty means all of them, which is the common case of one
+  // reader going through everything that was waiting.
+  const named =
+    checkedIndex === -1
+      ? []
+      : argv.slice(checkedIndex + 2).filter((one) => !one.startsWith("--"));
+
+  const root = logRoot(from);
+  if (!root) {
+    console.error(noLogRoot(from));
+    return 1;
+  }
+  let entries;
+  try {
+    entries = load(decisionsDir(root));
+  } catch (error) {
+    console.error("refused:", (error as Error).message);
+    return 1;
+  }
+  if (entries.length === 0) {
+    console.error(`no decisions/*.json found in ${decisionsDir(root)}`);
+    return 1;
+  }
+
+  // Two entries answering to one handle are refused here as render refuses
+  // them: metered anyway, the record counted one entry where the log holds
+  // two, and a genuinely new decision was silently neither pending nor
+  // recorded on its own behalf.
+  const answering = new Map<string, Loaded[]>();
+  for (const entry of entries) {
+    for (const handle of new Set([entry.id, entry.alias])) {
+      if (!handle) continue;
+      answering.set(handle, [...(answering.get(handle) ?? []), entry]);
+    }
+  }
+  // An entry from a newer checkout is not metered as if it were old: what a
+  // newer schema means by its fields is unknown here, and a count over
+  // documents this tool cannot read is a count of nothing. Same gate as save,
+  // upgrade and render.
+  for (const entry of entries) {
+    const held = (entry.schema as number) ?? 1;
+    if (held > LATEST) {
+      console.error(
+        `refused: ${entry.stem}.json is schema v${held}, this checkout ` +
+          `knows up to v${LATEST}`,
+      );
+      return 1;
+    }
+    // And an older one goes to the tool that reads it, same as in render.
+    if (held < LATEST) {
+      console.error(
+        `refused: ${entry.stem}.json is schema v${held}. Run upgrade.mjs ` +
+          `once, then fold.`,
+      );
+      return 1;
+    }
+  }
+
+  let colliding = false;
+  for (const [handle, holders] of answering) {
+    if (holders.length > 1) {
+      colliding = true;
+      console.error(
+        `refused: ${holders.map((one) => `${one.stem}.json`).join(" and ")} ` +
+          `both answer to ${handle}. Repair the log first; render names the fix.`,
+      );
+    }
+  }
+  if (colliding) return 1;
+
+  const statePath = join(root, FOLD_STATE);
+  const state = readFoldState(statePath);
+  const holdsPath = join(root, "WHAT-HOLDS.md");
+  const holds = existsSync(holdsPath) ? readFileSync(holdsPath, "utf8") : null;
+  const { pending, problems, unrecorded, bootstrapped, unchecked } = status(
+    entries,
+    state,
+  );
+
+  // Nothing is stamped on top of a record with problems: a read-back over a
+  // record naming a nonexistent entry certified that record instead of
+  // surfacing it. A rebuild stays open, because replacing the record is the
+  // repair for a broken one.
+  if (problems.length && !rebuild && (done || checkedBy)) {
+    for (const one of problems) console.error(`  ${one}`);
+    console.error("refused: the record has problems; repair it, then record.");
+    return 1;
+  }
+
+  // Reading a fold back is its own act, done later and by somebody else, so it
+  // is recorded on its own rather than only at stamping time.
+  if (checkedBy && !done) {
+    if (unchecked.length === 0) {
+      console.log("nothing is waiting to be read back");
+      return 0;
+    }
+
+    // A read-back comes out per entry: a reader can answer for five of six and
+    // fail on the sixth. Stamping all of them together left exactly two moves
+    // then, claiming the failed one was read or throwing away five real
+    // verifications, and both are worse than the truth. So the reader's
+    // selection is recorded, and what they could not answer stays unchecked.
+    const byName = new Map<string, string>();
+    for (const entry of entries) {
+      byName.set(entry.id, entry.id);
+      byName.set(entry.stem, entry.id);
+      if (entry.alias) byName.set(entry.alias, entry.id);
+    }
+    const resolveOne = (one: string): string | null | "ambiguous" => {
+      const exact = byName.get(one);
+      if (exact) return exact;
+      const low = one.toLowerCase();
+      const matches = entries.filter(
+        (entry) => entry.stem.includes(low) || entry.id.includes(low),
+      );
+      if (matches.length > 1) return "ambiguous";
+      return matches[0]?.id ?? null;
+    };
+    // A reader name that names an entry is the forgotten-name slip in its
+    // E107 shape: "--checked-by cache-policy" stamped every waiting fold as
+    // read by a non-person. Checked before any stamping, selection or not -
+    // the first version of this guard sat inside the selection branch, and
+    // the very slip it existed for arrives without one.
+    const reader = resolveOne(checkedBy);
+    if (reader !== null && reader !== "ambiguous") {
+      console.error(
+        `refused: --checked-by ${checkedBy} names an entry, not a reader. ` +
+          `The name comes first: --checked-by "who read it" ${checkedBy}`,
+      );
+      return 1;
+    }
+
+    let chosen = new Set(unchecked);
+    if (named.length) {
+      const wanted = new Set<string>();
+      for (const one of named) {
+        const id = resolveOne(one);
+        if (id === "ambiguous") {
+          console.error(
+            `refused: ${one} matches several entries. Say more of the name.`,
+          );
+          return 1;
+        }
+        if (!id) {
+          console.error(`refused: unknown entry: ${one}`);
+          return 1;
+        }
+        if (!chosen.has(id)) {
+          console.error(
+            `refused: ${one} is not waiting to be read back. Only a fold ` +
+              `its writer stamped can be read back.`,
+          );
+          return 1;
+        }
+        wanted.add(id);
+      }
+      chosen = wanted;
+    }
+
+    // The record's at is when the fold was recorded, and it stays: rewriting
+    // it to the read-back moment erased exactly the at-before-entry evidence
+    // the status check exists to catch. When the read-back happened is in git.
+    const next: FoldState = {
+      schema: STATE_SCHEMA,
+      folded: state.folded.map((one) =>
+        one.how === "unchecked" && chosen.has(one.id)
+          ? { ...one, how: "folded" as How, by: checkedBy }
+          : one,
+      ),
+    };
+    writeFileSync(statePath, JSON.stringify(next, null, 2) + "\n", "utf8");
+    console.log(`${chosen.size} fold(s) read back by ${checkedBy}`);
+    const left = unchecked.length - chosen.size;
+    if (left) console.log(`  ${left} still waiting for a reader`);
+    return 0;
+  }
+
+  if (done && bootstrap && rebuild) {
+    console.error("--bootstrap and --rebuild mean opposite things");
+    return 1;
+  }
+
+  if (done) {
+    if (holds === null) {
+      console.error(
+        `no WHAT-HOLDS.md in ${root}. The compressed layer is written by ` +
+          `whoever folds, never generated; write it first, then record it.`,
+      );
+      return 1;
+    }
+    if (!rebuild && pending.length === 0) {
+      console.log("nothing pending, record unchanged");
+      return problems.length ? 1 : 0;
+    }
+
+    const at = utcId(new Date());
+    // A rebuild replaces the record rather than appending to it: that is the
+    // only way entries swept in at bootstrap stop being swept in.
+    // Without a second reader named, the record says so rather than claiming
+    // the fold was verified.
+    const how: How = bootstrap
+      ? "bootstrap"
+      : checkedBy
+        ? "folded"
+        : "unchecked";
+    const next: FoldState = rebuild
+      ? {
+          schema: STATE_SCHEMA,
+          folded: entries.map((entry) => ({
+            id: entry.id,
+            at,
+            how,
+            ...(checkedBy ? { by: checkedBy } : {}),
+          })),
+        }
+      : {
+          schema: STATE_SCHEMA,
+          folded: [
+            ...state.folded,
+            ...pending.map((entry) => ({
+              id: entry.id,
+              at,
+              how,
+              ...(checkedBy ? { by: checkedBy } : {}),
+            })),
+          ],
+        };
+    writeFileSync(statePath, JSON.stringify(next, null, 2) + "\n", "utf8");
+    if (rebuild) {
+      const cleared = bootstrapped.length;
+      console.log(
+        `recorded a full fold of ${entries.length} entries` +
+          (cleared ? `, clearing ${cleared} that were only swept in` : ""),
+      );
+    } else {
+      console.log(
+        `recorded ${pending.length} as ${how}: ` + pending.map(label).join(", "),
+      );
+    }
+    for (const problem of problems) console.error("  problem:", problem);
+    return problems.length ? 1 : 0;
+  }
+
+  if (check) {
+    for (const problem of problems) console.error("  problem:", problem);
+    for (const entry of pending) {
+      console.log("  not folded:", label(entry), "-", entry.statement);
+    }
+    if (problems.length || pending.length) {
+      console.log(
+        `compressed layer is behind: ${pending.length} entries pending` +
+          (unrecorded ? ", nothing ever recorded" : ""),
+      );
+      return 1;
+    }
+    const debts = [
+      bootstrapped.length ? `${bootstrapped.length} swept in at bootstrap` : "",
+      unchecked.length ? `${unchecked.length} never read back` : "",
+    ].filter(Boolean);
+    // "Current" would overstate what was checked: the pending list and the
+    // impossible-record checks are verified, the folds themselves are only
+    // recorded. A hand-written record passes everything above.
+    console.log(
+      `fold record is complete: every entry has a fold recorded ` +
+        `(${state.folded.length} recorded` +
+        (debts.length ? `, ${debts.join(", ")}` : "") +
+        `)`,
+    );
+    console.log(
+      `recorded, not verified: whether each fold was written and read back ` +
+        `is what ${FOLD_STATE} asserts, which no script can check. ` +
+        `Question it where it changes: in the diff.`,
+    );
+    return 0;
+  }
+
+  for (const problem of problems) console.error("  problem:", problem);
+  if (!rebuild && pending.length === 0 && problems.length === 0) {
+    console.log(
+      `nothing to fold (${state.folded.length} recorded` +
+        (bootstrapped.length
+          ? `, ${bootstrapped.length} of them only swept in - clear that with --rebuild`
+          : "") +
+        `)`,
+    );
+    return 0;
+  }
+
+  if (unrecorded && holds !== null) {
+    console.log(
+      `${FOLD_STATE} does not exist yet. Check every entry below against ` +
+        `WHAT-HOLDS.md, fold what is missing, then record it. If the layer ` +
+        `was maintained by hand and you cannot certify it entry by entry, ` +
+        `record it with --bootstrap so the record says so.`,
+    );
+  }
+  const listing = rebuild ? entries : pending;
+  if (rebuild) console.log(rebuildWarning(entries.length));
+  for (const entry of listing) {
+    const rendered = join(decisionsDir(root), `${entry.stem}.md`);
+    console.log(`\n--- ${label(entry)} ---`);
+    console.log(
+      existsSync(rendered)
+        ? readFileSync(rendered, "utf8").trim()
+        : JSON.stringify(entry, null, 2),
+    );
+  }
+  console.log(`\n${RULES}${rebuild ? " --rebuild" : ""}`);
+  return 0;
+}
+
+// Only when run directly. Importing this file must not execute it,
+// otherwise no test and no other script can load it.
+// realpathSync on both sides: Node canonicalises import.meta.url through
+// symlinks but leaves process.argv[1] as typed, so reaching a script through
+// a symlinked path (/tmp on macOS, a dotfile manager, a network home) made
+// every one of these silently do nothing and exit 0. A save that reports
+// success and records nothing is worse than one that crashes.
+if (isDirectRun(import.meta.url)) {
+  // A bad file is named and refused, never a crash: the last net for
+  // anything a shape check below main did not already turn into a clean
+  // refusal. save.ts wraps its main the same way.
+  try {
+    process.exitCode = main(process.argv.slice(2));
+  } catch (error) {
+    console.error("refused:", (error as Error).message);
+    process.exitCode = 1;
+  }
+}

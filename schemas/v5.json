@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bosun/decision/v5",
+  "title": "bosun decision, schema 5",
+  "description": "One decision. Changes from v4: the id ends in -utc, so the string states its own time zone instead of relying on this schema travelling with it. An id quoted in another project, a ticket or a commit message is now unambiguous on its own.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "date",
+    "origin",
+    "author_role",
+    "statement",
+    "decision",
+    "why",
+    "falsifier"
+  ],
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "description": "Version of this document's structure."
+    },
+    "id": {
+      "type": "string",
+      "description": "Stable opaque identifier, never reused and never changed. New entries use a UTC timestamp formatted YYYY-MM-DD-HH-MM-SS-mmm-utc, for example 2026-08-28-17-16-23-456-utc. Entries from schema v1 carry a slug instead. Hyphens only, so the id is safe in filenames, URLs and shell arguments on every platform."
+    },
+    "alias": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Short human label such as E18. Typed by people in prose."
+    },
+    "date": {
+      "type": "string",
+      "description": "YYYY-MM-DD, the day the decision was made."
+    },
+    "origin": {
+      "type": "string",
+      "description": "Project the decision came from. Required so knowledge can travel and stay checkable."
+    },
+    "author_role": {
+      "type": "string",
+      "enum": [
+        "human",
+        "agent",
+        "system"
+      ],
+      "description": "Role, not person. The log answers why it is so, never who was wrong."
+    },
+    "statement": {
+      "type": "string",
+      "description": "A statement, not a topic."
+    },
+    "quote": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "lang"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "lang": {
+          "type": "string"
+        }
+      },
+      "description": "The triggering sentence, verbatim, in the language it was said in."
+    },
+    "trigger": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "why": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rejected": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "because"
+        ],
+        "properties": {
+          "option": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "The alternatives that lost, and why. Without these the same option gets reconsidered next time."
+    },
+    "reason_type": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "measured",
+        "argued",
+        "gut-feeling",
+        "time-pressure",
+        "imposed",
+        "forgotten",
+        "knowingly-unclean",
+        null
+      ],
+      "description": "Unglamorous values are first-class. Countable, so the claim that honest entries exist can be checked."
+    },
+    "implementation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "consequence": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "falsifier": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "What one would observe to know this was wrong. Required: without it the log is an archive."
+    },
+    "supersedes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Ids or aliases this entry replaces. Mandatory for compression to be able to remove a stale rule."
+    },
+    "superseded_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provenance": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}
